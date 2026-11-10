@@ -1,0 +1,11 @@
+wall
+libwall.so
+obasm
+*.o
+*.ll
+*.s
+*.bc
+tmp_*
+build
+hello
+hello_final
