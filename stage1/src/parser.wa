@@ -5,3 +5,19 @@ fn parse_module(tokens: string) -> string {
     // Parse tokens: fn decls, global decls, function bodies
     return "";
 }
+
+fn parse_fn(tokens: string) -> string {
+    return "";
+}
+
+fn parse_global(tokens: string) -> string {
+    return "";
+}
+
+fn parse_stmt(tokens: string) -> string {
+    return "";
+}
+
+fn parse_block(tokens: string) -> string {
+    return "";
+}

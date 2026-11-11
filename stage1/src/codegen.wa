@@ -2,12 +2,10 @@
 // Emits LLVM IR textual assembly (.s) from the parsed module.
 
 fn emit_module(module: string, optimize_level: i32) -> string {
-    // Emit LLVM IR: module header, string globals, declare printf, defines
     let ir: string = "";
     ir = ir + "; ModuleID = 'wall";
     ir = ir + "';\n";
     ir = ir + "declare i32 @printf(ptr, ...)\n";
-    // For each function in module: define i32 @name(params) { ... }
     let fname: string = "";
     let fargs: string = "";
     let fbody: string = "";
@@ -15,4 +13,71 @@ fn emit_module(module: string, optimize_level: i32) -> string {
     ir = ir + "  ret i32 0\n";
     ir = ir + "}\n";
     return ir;
+}
+
+fn emit_global_int(name: string, ty: i32, val: i32) -> string {
+    let ir: string = "";
+    if ty == 1 {
+        ir = ir + "@" + name + " = global i32 " + ty_string_i32() + " " + i_string(val) + "\n";
+    }
+    if ty == 2 {
+        ir = ir + "@" + name + " = global i64 " + ty_string_i64() + " " + i_string_i64(val) + "\n";
+    }
+    if ty == 3 {
+        ir = ir + "@" + name + " = global float " + ty_string_float() + " " + f_string(val) + "\n";
+    }
+    if ty == 4 {
+        ir = ir + "@" + name + " = global double " + ty_string_double() + " " + d_string(val) + "\n";
+    }
+    if ty == 5 {
+        ir = ir + "@" + name + " = global i1 " + ty_string_bool() + " " + b_string(val) + "\n";
+    }
+    if ty == 6 {
+        ir = ir + "@" + name + " = global ptr " + ty_string_ptr() + " null\n";
+    }
+    return ir;
+}
+
+fn ty_string_i32() -> string {
+    return "i32";
+}
+
+fn ty_string_i64() -> string {
+    return "i64";
+}
+
+fn ty_string_float() -> string {
+    return "float";
+}
+
+fn ty_string_double() -> string {
+    return "double";
+}
+
+fn ty_string_bool() -> string {
+    return "i1";
+}
+
+fn ty_string_ptr() -> string {
+    return "ptr";
+}
+
+fn i_string(v: i32) -> string {
+    return "0";
+}
+
+fn i_string_i64(v: i32) -> string {
+    return "0";
+}
+
+fn f_string(v: i32) -> string {
+    return "0.0";
+}
+
+fn d_string(v: i32) -> string {
+    return "0.0";
+}
+
+fn b_string(v: i32) -> string {
+    return "false";
 }

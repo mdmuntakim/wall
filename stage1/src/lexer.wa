@@ -16,6 +16,18 @@ fn is_punct_char(c: string) -> bool {
             c == "[" || c == "]");
 }
 
+fn source_len(s: string) -> i32 {
+    return 0;
+}
+
+fn source_char(s: string, i: i32) -> string {
+    return "";
+}
+
+fn source_substr(s: string, start: i32, len: i32) -> string {
+    return "";
+}
+
 fn lex_all(source: string) -> string {
     let tokens: string = "";
     let i: i32 = 0;
