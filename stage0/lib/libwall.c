@@ -82,6 +82,19 @@ static void lex(Lexer *L) {
   for (;;) {
     char c = L->src[L->pos];
     if (c == 0) { Token t; memset(&t, 0, sizeof(t)); t.type = TK_EOF; t.line = L->line; t.col = L->col; tok_push(L, t); break; }
+    if (c == '/' && L->src[L->pos + 1] == '/') {
+      while (L->src[L->pos] && L->src[L->pos] != '\n') { L->pos++; L->col++; }
+      continue;
+    }
+    if (c == '/' && L->src[L->pos + 1] == '*') {
+      L->pos += 2; L->col += 2;
+      while (L->src[L->pos] && !(L->src[L->pos] == '*' && L->src[L->pos + 1] == '/')) {
+        if (L->src[L->pos] == '\n') { L->line++; L->col = 1; } else L->col++;
+        L->pos++;
+      }
+      if (L->src[L->pos]) { L->pos += 2; L->col += 2; }
+      continue;
+    }
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { if (c=='\n'){L->line++; L->col=1;} else L->col++; L->pos++; continue; }
     Token t; memset(&t, 0, sizeof(t)); t.line = L->line; t.col = L->col;
     if (isalpha((unsigned char)c) || c == '_') {
@@ -118,9 +131,15 @@ static void lex(Lexer *L) {
     }
     {
       char c1 = L->src[L->pos];
-      const char *two = NULL;
-      if ((c1=='-'&&L->src[L->pos+1]=='>')||(c1=='&'&&L->src[L->pos+1]=='&')||(c1=='|'&&L->src[L->pos+1]=='|')||(c1=='='&&L->src[L->pos+1]=='=')||(c1=='!'&&L->src[L->pos+1]=='=')||(c1=='<'&&L->src[L->pos+1]=='=')||(c1=='>'&&L->src[L->pos+1]=='>')) two = L->src + L->pos;
-      if (two) { char tb[3]; tb[0] = c1; tb[1] = L->src[L->pos + 1]; tb[2] = 0; t.type = TK_PUNCT; t.text = xstrdup(tb); tok_push(L, t); L->pos += 2; L->col += 2; continue; }
+      char tb[3]; tb[0] = c1; tb[1] = L->src[L->pos + 1]; tb[2] = 0;
+      int is_two = !strcmp(tb, "->") || !strcmp(tb, "&&") || !strcmp(tb, "||") ||
+                   !strcmp(tb, "==") || !strcmp(tb, "!=") || !strcmp(tb, "<=") ||
+                   !strcmp(tb, ">=") || !strcmp(tb, ">>") || !strcmp(tb, "<<") ||
+                   !strcmp(tb, "+=") || !strcmp(tb, "-=") || !strcmp(tb, "*=") ||
+                   !strcmp(tb, "/=") || !strcmp(tb, "%=") || !strcmp(tb, "&=") ||
+                   !strcmp(tb, "|=") || !strcmp(tb, "^=") || !strcmp(tb, "=>") ||
+                   !strcmp(tb, "::") || !strcmp(tb, "..");
+      if (is_two) { t.type = TK_PUNCT; t.text = xstrdup(tb); tok_push(L, t); L->pos += 2; L->col += 2; continue; }
       if (strchr("+-*/<>=!&|^%~?:,(){}[];", c1)) { t.type = TK_PUNCT; t.text = xstrfmt("%c", c1); tok_push(L, t); L->pos++; L->col++; continue; }
       L->had_err = 1; snprintf(L->err, sizeof(L->err), "%d:%d: error: unexpected character '%c'", L->line, L->col, c); break;
     }

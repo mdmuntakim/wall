@@ -16,4 +16,10 @@ clang --target=aarch64-unknown-linux-android24 -I stage0/include \
 echo "==> Building obasm (assembler: .s -> .o)..."
 clang --target=aarch64-unknown-linux-android24 tools/obasm.c -o obasm
 
+echo "==> Building linker (linker: .o -> .so / ELF)..."
+clang --target=aarch64-unknown-linux-android24 tools/linker.c -o linker
+
 echo "Build OK"
+echo "   wall   - Wall compiler driver (.wa -> .s)"
+echo "   obasm  - object assembler (.s -> .o)"
+echo "   linker - linker (.o -> .so / ELF)"

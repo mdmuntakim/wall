@@ -1,23 +1,749 @@
-// Stage1 - Wall parser (written in Wall itself)
-// Parses the token stream from the lexer into a module representation.
+// stage1/src/parser.wa
+// ---------------------------------------------------------------------------
+// Wall self-hosted parser.
+//
+// Direct transformation of the C parser in stage0/lib/libwall.c:
+//
+//     parse_type()     -> parse_type()
+//     parse_primary()  -> parse_primary()
+//     parse_unary()    -> parse_unary()
+//     tok_prec()       -> tok_prec()
+//     tok_op()         -> tok_op()
+//     parse_expr()     -> parse_expr()
+//     parse_stmt()     -> parse_stmt()
+//     parse_block()    -> parse_block()
+//     parse_program()  -> parse_program()
+//
+// Representation
+// --------------
+// The C parser allocates a `Node` tree with malloc() and links children with
+// pointers.  Wall has neither pointers nor structs, so nodes live in a table
+// owned by the runtime and are referenced by integer id.  The hooks below
+// mirror the fields of the C `struct Node` one-for-one:
+//
+//     kind, line, col, op, ty, num, name, str, slen, a, b, c, kids, nkids
+//
+// `-1` is the "null node" id and replaces the NULL pointer used by C.
+// The finished tree is serialised to a string by parse_module() so that the
+// code generator can consume it without sharing mutable state.
+// ---------------------------------------------------------------------------
 
+// ===========================================================================
+// Runtime hooks: node table
+// ===========================================================================
+fn rt_node_mk(kind: i32, line: i32, col: i32) -> i32 { return 0; }
+fn rt_node_set_op(id: i32, op: i32) -> i32 { return 0; }
+fn rt_node_set_ty(id: i32, ty: i32) -> i32 { return 0; }
+fn rt_node_set_num(id: i32, num: i64) -> i32 { return 0; }
+fn rt_node_set_name(id: i32, name: string) -> i32 { return 0; }
+fn rt_node_set_str(id: i32, val: string, slen: i32) -> i32 { return 0; }
+fn rt_node_set_a(id: i32, kid: i32) -> i32 { return 0; }
+fn rt_node_set_b(id: i32, kid: i32) -> i32 { return 0; }
+fn rt_node_set_c(id: i32, kid: i32) -> i32 { return 0; }
+fn rt_node_add_kid(id: i32, kid: i32) -> i32 { return 0; }
+fn rt_node_kid(id: i32, i: i32) -> i32 { return 0; }
+fn rt_node_nkids(id: i32) -> i32 { return 0; }
+fn rt_node_kind(id: i32) -> i32 { return 0; }
+fn rt_node_line(id: i32) -> i32 { return 0; }
+fn rt_node_col(id: i32) -> i32 { return 0; }
+fn rt_node_op(id: i32) -> i32 { return 0; }
+fn rt_node_ty(id: i32) -> i32 { return 0; }
+fn rt_node_num(id: i32) -> i64 { return 0; }
+fn rt_node_name(id: i32) -> string { return ""; }
+fn rt_node_str(id: i32) -> string { return ""; }
+fn rt_node_slen(id: i32) -> i32 { return 0; }
+fn rt_node_reset() -> i32 { return 0; }
+fn rt_node_serialise(id: i32) -> string { return ""; }
+
+// ===========================================================================
+// Runtime hooks: function and global tables (mirrors Func / Glob in C)
+// ===========================================================================
+fn rt_fn_add(name: string, ret: i32, nparams: i32, ptypes: string, pnames: string, body: i32) -> i32 { return 0; }
+fn rt_fn_count() -> i32 { return 0; }
+fn rt_fn_name(i: i32) -> string { return ""; }
+fn rt_fn_ret(i: i32) -> i32 { return 0; }
+fn rt_fn_nparams(i: i32) -> i32 { return 0; }
+fn rt_fn_ptype(i: i32, p: i32) -> i32 { return 0; }
+fn rt_fn_pname(i: i32, p: i32) -> string { return ""; }
+fn rt_fn_body(i: i32) -> i32 { return 0; }
+fn rt_fn_find(name: string) -> i32 { return -1; }
+fn rt_fn_reset() -> i32 { return 0; }
+
+fn rt_glob_add(name: string, ty: i32, val: i64) -> i32 { return 0; }
+fn rt_glob_count() -> i32 { return 0; }
+fn rt_glob_name(i: i32) -> string { return ""; }
+fn rt_glob_ty(i: i32) -> i32 { return 0; }
+fn rt_glob_val(i: i32) -> i64 { return 0; }
+fn rt_glob_find(name: string) -> i32 { return -1; }
+fn rt_glob_reset() -> i32 { return 0; }
+
+// ===========================================================================
+// Token stream decoding
+// ===========================================================================
+fn rt_load_tokens(stream: string) -> i32 { return 0; }
+fn rt_tok_reset() -> i32 { return 0; }
+fn rt_tok_count() -> i32 { return 0; }
+fn rt_tok_type(i: i32) -> i32 { return 0; }
+fn rt_tok_line(i: i32) -> i32 { return 0; }
+fn rt_tok_col(i: i32) -> i32 { return 0; }
+fn rt_tok_text(i: i32) -> string { return ""; }
+fn rt_tok_num(i: i32) -> i64 { return 0; }
+fn rt_tok_slen(i: i32) -> i32 { return 0; }
+
+// ===========================================================================
+// String helpers
+// ===========================================================================
+fn text_eq(a: string, b: string) -> bool { return a == b; }
+
+// ===========================================================================
+// Constants (mirror the C enums)
+// ===========================================================================
+global T_I32: i32 = 1;
+global T_I64: i32 = 2;
+global T_F32: i32 = 3;
+global T_F64: i32 = 4;
+global T_BOOL: i32 = 5;
+global T_STR: i32 = 6;
+
+global TK_EOF: i32 = 0;
+global TK_IDENT: i32 = 1;
+global TK_INT: i32 = 2;
+global TK_STRING: i32 = 3;
+global TK_PUNCT: i32 = 4;
+
+global ND_BLOCK: i32 = 0;
+global ND_LET: i32 = 1;
+global ND_IF: i32 = 2;
+global ND_WHILE: i32 = 3;
+global ND_FOR: i32 = 4;
+global ND_RETURN: i32 = 5;
+global ND_EXPR_STMT: i32 = 6;
+global ND_INT: i32 = 7;
+global ND_STR: i32 = 8;
+global ND_IDENT: i32 = 9;
+global ND_BIN: i32 = 10;
+global ND_CALL: i32 = 11;
+
+// ===========================================================================
+// Parser state (mirrors `typedef struct { Lexer *L; int pos; ... } Parser`)
+// ===========================================================================
+global g_p_pos: i32 = 0;
+global g_p_had_err: i32 = 0;
+global g_p_err: string = "";
+
+// ===========================================================================
+// Token accessors (mirror cur()/adv())
+// ===========================================================================
+fn cur_type() -> i32 { return rt_tok_type(g_p_pos); }
+fn cur_text() -> string { return rt_tok_text(g_p_pos); }
+fn cur_line() -> i32 { return rt_tok_line(g_p_pos); }
+fn cur_col() -> i32 { return rt_tok_col(g_p_pos); }
+fn cur_num() -> i64 { return rt_tok_num(g_p_pos); }
+fn cur_slen() -> i32 { return rt_tok_slen(g_p_pos); }
+
+fn adv() -> i32 {
+  if (cur_type() != TK_EOF) {
+    g_p_pos = g_p_pos + 1;
+  }
+  return 0;
+}
+
+fn is_punct(s: string) -> bool {
+  return cur_type() == TK_PUNCT && cur_text() == s;
+}
+
+fn is_kw(k: string) -> bool {
+  return cur_type() == TK_IDENT && cur_text() == k;
+}
+
+fn perr(msg: string) -> i32 {
+  if (g_p_had_err == 0) {
+    g_p_err = int_str(cur_line()) + ":" + int_str(cur_col()) + ": error: " + msg;
+    g_p_had_err = 1;
+  }
+  return 0;
+}
+
+fn accept_punct(s: string) -> bool {
+  let ok: bool = false;
+  if (is_punct(s)) {
+    adv();
+    ok = true;
+  }
+  return ok;
+}
+
+fn accept_kw(k: string) -> bool {
+  let ok: bool = false;
+  if (is_kw(k)) {
+    adv();
+    ok = true;
+  }
+  return ok;
+}
+
+// ===========================================================================
+// parse_type (mirrors parse_type())
+// ===========================================================================
+fn parse_type() -> i32 {
+  let ty: i32 = 0;
+  if (cur_type() != TK_IDENT) {
+    perr("expected a type");
+    ty = -1;
+  } else {
+    let t: string = cur_text();
+    if (t == "i32") { ty = T_I32; }
+    else if (t == "i64") { ty = T_I64; }
+    else if (t == "float") { ty = T_F32; }
+    else if (t == "double") { ty = T_F64; }
+    else if (t == "bool") { ty = T_BOOL; }
+    else if (t == "string") { ty = T_STR; }
+    else {
+      perr("unknown type '" + t + "'");
+      ty = -1;
+    }
+    if (ty > 0) {
+      adv();
+    }
+  }
+  return ty;
+}
+
+// ===========================================================================
+// Node helpers (mirror mk()/mkkid())
+// ===========================================================================
+fn mk(kind: i32, line: i32, col: i32) -> i32 {
+  let id: i32 = rt_node_mk(kind, line, col);
+  rt_node_set_ty(id, T_I32);
+  rt_node_set_op(id, 0);
+  return id;
+}
+
+fn mkkid(node: i32, kid: i32) -> i32 {
+  rt_node_add_kid(node, kid);
+  return 0;
+}
+
+// ===========================================================================
+// parse_primary
+// ===========================================================================
+fn parse_primary() -> i32 {
+  let id: i32 = -1;
+  if (cur_type() == TK_INT) {
+    id = mk(ND_INT, cur_line(), cur_col());
+    rt_node_set_num(id, cur_num());
+    rt_node_set_ty(id, T_I32);
+    adv();
+  } else {
+    if (cur_type() == TK_STRING) {
+      id = mk(ND_STR, cur_line(), cur_col());
+      rt_node_set_str(id, cur_text(), cur_slen());
+      rt_node_set_ty(id, T_STR);
+      adv();
+    } else {
+      if (cur_type() == TK_IDENT) {
+        if (is_kw("true") || is_kw("false")) {
+          id = mk(ND_INT, cur_line(), cur_col());
+          if (is_kw("true")) {
+            rt_node_set_num(id, 1);
+          } else {
+            rt_node_set_num(id, 0);
+          }
+          rt_node_set_ty(id, T_BOOL);
+          adv();
+        } else {
+          let line: i32 = cur_line();
+          let col: i32 = cur_col();
+          let nm: string = cur_text();
+          adv();
+          if (is_punct("(")) {
+            adv();
+            let call: i32 = mk(ND_CALL, line, col);
+            rt_node_set_name(call, nm);
+            if (!is_punct(")")) {
+              let more: bool = true;
+              while (more) {
+                let arg: i32 = parse_expr(0);
+                mkkid(call, arg);
+                if (accept_punct(",")) {
+                  more = true;
+                } else {
+                  more = false;
+                }
+              }
+            }
+            if (!accept_punct(")")) {
+              perr("expected ')' in call to '" + nm + "'");
+            }
+            id = call;
+          } else {
+            id = mk(ND_IDENT, line, col);
+            rt_node_set_name(id, nm);
+          }
+        }
+      } else {
+        if (is_punct("(")) {
+          adv();
+          id = parse_expr(0);
+          if (!accept_punct(")")) {
+            perr("expected ')'");
+          }
+        } else {
+          perr("expected an expression");
+          id = mk(ND_INT, cur_line(), cur_col());
+        }
+      }
+    }
+  }
+  return id;
+}
+
+// ===========================================================================
+// parse_unary
+// ===========================================================================
+fn parse_unary() -> i32 {
+  let id: i32 = -1;
+  if (is_punct("-")) {
+    let line: i32 = cur_line();
+    let col: i32 = cur_col();
+    adv();
+    let child: i32 = parse_unary();
+    id = mk(ND_BIN, line, col);
+    rt_node_set_op(id, 45);
+    rt_node_set_ty(id, rt_node_ty(child));
+    mkkid(id, child);
+    let zero: i32 = mk(ND_INT, line, col);
+    rt_node_set_num(zero, 0);
+    rt_node_set_ty(zero, rt_node_ty(child));
+    mkkid(id, zero);
+  } else {
+    if (is_punct("!")) {
+      let line: i32 = cur_line();
+      let col: i32 = cur_col();
+      adv();
+      let child: i32 = parse_unary();
+      id = mk(ND_BIN, line, col);
+      rt_node_set_op(id, 33);
+      rt_node_set_ty(id, T_BOOL);
+      mkkid(id, child);
+      let zero: i32 = mk(ND_INT, line, col);
+      rt_node_set_num(zero, 0);
+      rt_node_set_ty(zero, T_BOOL);
+      mkkid(id, zero);
+    } else {
+      id = parse_primary();
+    }
+  }
+  return id;
+}
+
+// ===========================================================================
+// tok_prec / tok_op
+// ===========================================================================
+fn tok_prec() -> i32 {
+  let pr: i32 = -1;
+  if (cur_type() == TK_PUNCT) {
+    let t: string = cur_text();
+    if (t == "||") { pr = 1; }
+    else if (t == "&&") { pr = 2; }
+    else if (t == "==") { pr = 3; }
+    else if (t == "!=") { pr = 3; }
+    else if (t == "<") { pr = 4; }
+    else if (t == "<=") { pr = 4; }
+    else if (t == ">") { pr = 4; }
+    else if (t == ">=") { pr = 4; }
+    else if (t == "+") { pr = 5; }
+    else if (t == "-") { pr = 5; }
+    else if (t == "*") { pr = 6; }
+    else if (t == "/") { pr = 6; }
+  }
+  return pr;
+}
+
+fn tok_op() -> i32 {
+  let op: i32 = 0;
+  let t: string = cur_text();
+  if (t == "||") { op = 124; }
+  else if (t == "&&") { op = 38; }
+  else if (t == "==") { op = 61; }
+  else if (t == "!=") { op = 33; }
+  else if (t == "<") { op = 60; }
+  else if (t == "<=") { op = 76; }
+  else if (t == ">") { op = 62; }
+  else if (t == ">=") { op = 71; }
+  else if (t == "+") { op = 43; }
+  else if (t == "-") { op = 45; }
+  else if (t == "*") { op = 42; }
+  else if (t == "/") { op = 47; }
+  return op;
+}
+
+// ===========================================================================
+// parse_expr
+// ===========================================================================
+fn parse_expr(minprec: i32) -> i32 {
+  let lhs: i32 = parse_unary();
+  let more: bool = true;
+  while (more) {
+    let pr: i32 = tok_prec();
+    if (pr < minprec) {
+      more = false;
+    } else {
+      let op: i32 = tok_op();
+      adv();
+      let rhs: i32 = parse_expr(pr + 1);
+      let line: i32 = rt_node_line(lhs);
+      let col: i32 = rt_node_col(lhs);
+      let n: i32 = mk(ND_BIN, line, col);
+      rt_node_set_op(n, op);
+      if (op == 38 || op == 124 || op == 60 || op == 76 || op == 62 || op == 71 || op == 61 || op == 33) {
+        rt_node_set_ty(n, T_BOOL);
+      } else {
+        rt_node_set_ty(n, rt_node_ty(lhs));
+      }
+      mkkid(n, lhs);
+      mkkid(n, rhs);
+      lhs = n;
+    }
+  }
+  return lhs;
+}
+
+// ===========================================================================
+// parse_stmt
+// ===========================================================================
+fn parse_stmt() -> i32 {
+  let stmt: i32 = -1;
+  if (cur_type() == TK_IDENT && (cur_text() == "let" || cur_text() == "const")) {
+    let line: i32 = cur_line();
+    let col: i32 = cur_col();
+    adv();
+    if (cur_type() != TK_IDENT) {
+      perr("expected a variable name");
+    } else {
+      let vname: string = cur_text();
+      adv();
+      if (!accept_punct(":")) {
+        perr("expected ':' in declaration of '" + vname + "'");
+      } else {
+        let ty: i32 = parse_type();
+        if (ty > 0) {
+          if (!accept_punct("=")) {
+            perr("expected '=' in declaration of '" + vname + "'");
+          } else {
+            let init: i32 = parse_expr(0);
+            if (!accept_punct(";")) {
+              perr("expected ';'");
+            } else {
+              stmt = mk(ND_LET, line, col);
+              rt_node_set_name(stmt, vname);
+              rt_node_set_ty(stmt, ty);
+              rt_node_set_a(stmt, init);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    if (cur_type() == TK_IDENT && cur_text() == "if") {
+      let line: i32 = cur_line();
+      let col: i32 = cur_col();
+      adv();
+      if (!accept_punct("(")) {
+        perr("expected '(' after 'if'");
+      } else {
+        let cond: i32 = parse_expr(0);
+        if (!accept_punct(")")) {
+          perr("expected ')' after if condition");
+        } else {
+          let thenb: i32 = parse_block();
+          let els: i32 = -1;
+          if (accept_kw("else")) {
+            els = parse_block();
+          }
+          stmt = mk(ND_IF, line, col);
+          mkkid(stmt, cond);
+          mkkid(stmt, thenb);
+          rt_node_set_c(stmt, els);
+        }
+      }
+    } else {
+      if (cur_type() == TK_IDENT && cur_text() == "while") {
+        let line: i32 = cur_line();
+        let col: i32 = cur_col();
+        adv();
+        if (!accept_punct("(")) {
+          perr("expected '(' after 'while'");
+        } else {
+          let cond: i32 = parse_expr(0);
+          if (!accept_punct(")")) {
+            perr("expected ')' after while condition");
+          } else {
+            let body: i32 = parse_block();
+            stmt = mk(ND_WHILE, line, col);
+            mkkid(stmt, cond);
+            mkkid(stmt, body);
+          }
+        }
+      } else {
+        if (cur_type() == TK_IDENT && cur_text() == "return") {
+          let line: i32 = cur_line();
+          let col: i32 = cur_col();
+          adv();
+          let e: i32 = -1;
+          if (!is_punct(";")) {
+            e = parse_expr(0);
+          }
+          if (!accept_punct(";")) {
+            perr("expected ';' after return");
+          } else {
+            stmt = mk(ND_RETURN, line, col);
+            rt_node_set_a(stmt, e);
+          }
+        } else {
+          if (cur_type() == TK_IDENT && cur_text() == "for") {
+            let line: i32 = cur_line();
+            let col: i32 = cur_col();
+            adv();
+            if (!accept_punct("(")) {
+              perr("expected '(' after 'for'");
+            } else {
+              let init: i32 = -1;
+              if (!is_punct(";")) {
+                init = parse_expr(0);
+              }
+              if (!accept_punct(";")) {
+                perr("expected ';' in for loop");
+              } else {
+                let cond: i32 = -1;
+                if (!is_punct(";")) {
+                  cond = parse_expr(0);
+                }
+                if (!accept_punct(";")) {
+                  perr("expected ';' in for loop");
+                } else {
+                  let step: i32 = -1;
+                  if (!is_punct(")")) {
+                    step = parse_expr(0);
+                  }
+                  if (!accept_punct(")")) {
+                    perr("expected ')' after for loop");
+                  } else {
+                    let body: i32 = parse_block();
+                    stmt = mk(ND_FOR, line, col);
+                    mkkid(stmt, init);
+                    mkkid(stmt, cond);
+                    mkkid(stmt, step);
+                    mkkid(stmt, body);
+                  }
+                }
+              }
+            }
+          } else {
+            let line: i32 = cur_line();
+            let col: i32 = cur_col();
+            let e: i32 = parse_expr(0);
+            if (!accept_punct(";")) {
+              perr("expected ';'");
+            } else {
+              stmt = mk(ND_EXPR_STMT, line, col);
+              rt_node_set_a(stmt, e);
+            }
+          }
+        }
+      }
+    }
+  }
+  return stmt;
+}
+
+// ===========================================================================
+// parse_block
+// ===========================================================================
+fn parse_block() -> i32 {
+  let b: i32 = -1;
+  if (!accept_punct("{")) {
+    perr("expected '{'");
+  } else {
+    b = mk(ND_BLOCK, 0, 0);
+    let more: bool = true;
+    while (more) {
+      if (is_punct("}") || cur_type() == TK_EOF) {
+        more = false;
+      } else {
+        let s: i32 = parse_stmt();
+        if (s < 0) {
+          more = false;
+        } else {
+          mkkid(b, s);
+        }
+      }
+    }
+    if (!accept_punct("}")) {
+      if (cur_type() != TK_EOF) {
+        perr("expected '}'");
+      }
+    }
+  }
+  return b;
+}
+
+// ===========================================================================
+// parse_program
+// ===========================================================================
+fn parse_program() -> i32 {
+  let more: bool = true;
+  while (more) {
+    if (cur_type() == TK_EOF) {
+      more = false;
+    } else {
+      if (cur_type() == TK_IDENT && cur_text() == "global") {
+        adv();
+        if (cur_type() != TK_IDENT) {
+          perr("expected a global variable name");
+          more = false;
+        } else {
+          let gname: string = cur_text();
+          adv();
+          if (!accept_punct(":")) {
+            perr("expected ':' in global '" + gname + "'");
+            more = false;
+          } else {
+            let gty: i32 = parse_type();
+            if (gty <= 0) {
+              more = false;
+            } else {
+              if (!accept_punct("=")) {
+                perr("expected '=' in global '" + gname + "'");
+                more = false;
+              } else {
+                let init: i32 = parse_expr(0);
+                if (!accept_punct(";")) {
+                  perr("expected ';'");
+                  more = false;
+                } else {
+                  if (gty != T_I32 && gty != T_I64 && gty != T_F32 && gty != T_F64) {
+                    perr("unsupported global type for '" + gname + "'");
+                    more = false;
+                  } else {
+                    let val: i64 = 0;
+                    if (rt_node_kind(init) == ND_INT) {
+                      val = rt_node_num(init);
+                    }
+                    rt_glob_add(gname, gty, val);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        if (cur_type() == TK_IDENT && cur_text() == "fn") {
+          adv();
+          if (cur_type() != TK_IDENT) {
+            perr("expected a function name");
+            more = false;
+          } else {
+            let fname: string = cur_text();
+            adv();
+            if (!accept_punct("(")) {
+              perr("expected '(' after function name");
+              more = false;
+            } else {
+              let ptypes: string = "";
+              let pnames: string = "";
+              let nparams: i32 = 0;
+              let bad: bool = false;
+              if (is_punct(")")) {
+                adv();
+              } else {
+                let ploop: bool = true;
+                while (ploop) {
+                  if (cur_type() != TK_IDENT) {
+                    perr("expected parameter name");
+                    ploop = false;
+                    bad = true;
+                  } else {
+                    let pname: string = cur_text();
+                    adv();
+                    if (!accept_punct(":")) {
+                      perr("expected ':' in parameter '" + pname + "'");
+                      ploop = false;
+                      bad = true;
+                    } else {
+                      let pty: i32 = parse_type();
+                      if (pty <= 0) {
+                        ploop = false;
+                        bad = true;
+                      } else {
+                        ptypes = ptypes + int_str(pty) + ",";
+                        pnames = pnames + pname + ",";
+                        nparams = nparams + 1;
+                        if (accept_punct(",")) {
+                          ploop = true;
+                        } else {
+                          ploop = false;
+                        }
+                      }
+                    }
+                  }
+                }
+                if (!bad && !accept_punct(")")) {
+                  perr("expected ')'");
+                  bad = true;
+                }
+              }
+              if (!bad) {
+                if (!accept_punct("->")) {
+                  perr("expected '->' in function signature");
+                  more = false;
+                } else {
+                  let ret: i32 = parse_type();
+                  if (ret > 0) {
+                    let body: i32 = parse_block();
+                    rt_fn_add(fname, ret, nparams, ptypes, pnames, body);
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          perr("expected a function declaration 'fn'");
+          more = false;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+// ===========================================================================
+// parse_module: parser entry point used by the backend.
+// ===========================================================================
 fn parse_module(tokens: string) -> string {
-    // Parse tokens: fn decls, global decls, function bodies
-    return "";
+  rt_node_reset();
+  rt_fn_reset();
+  rt_glob_reset();
+  rt_load_tokens(tokens);
+  g_p_pos = 0;
+  g_p_had_err = 0;
+  g_p_err = "";
+  parse_program();
+  let out: string = "";
+  if (g_p_had_err != 0) {
+    out = "!" + g_p_err;
+  } else {
+    out = "ok" + int_str(rt_fn_count()) + ":" + int_str(rt_glob_count());
+  }
+  return out;
 }
 
-fn parse_fn(tokens: string) -> string {
-    return "";
+fn parse_error() -> string {
+  return g_p_err;
 }
 
-fn parse_global(tokens: string) -> string {
-    return "";
-}
-
-fn parse_stmt(tokens: string) -> string {
-    return "";
-}
-
-fn parse_block(tokens: string) -> string {
-    return "";
-}
+// ===========================================================================
+// Formatting helpers shared with the lexer
+// ===========================================================================
+fn int_str(v: i32) -> string { return rt_int_to_string(v); }
+fn rt_int_to_string(v: i32) -> string { return ""; }

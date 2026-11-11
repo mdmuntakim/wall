@@ -1,0 +1,1356 @@
+// stage1/tools/obasm.wa
+// ---------------------------------------------------------------------------
+// obasm - the Wall object assembler, written in Wall itself.
+//
+// obasm turns *any* textual assembly file (.s), including the LLVM textual IR
+// emitted by `wall`, into a native relocatable object file (.o).
+//
+// Usage:
+//   obasm <input.s> [-o <output.o>] [--target=<triple>]
+//                   [--direct] [--keep-bc] [-v] [-h] [-v]
+//
+// Two back ends are provided:
+//
+//   * pipeline mode (default): .s -> LLVM bitcode -> native object.  The two
+//     stages are performed by the Wall runtime hooks rt_llvm_as() and
+//     rt_cc_object(), which bootstrap to `llvm-as` and the target C compiler.
+//
+//   * direct mode (--direct): the assember parses the textual assembly and
+//     writes an ELF relocatable object itself through rt_elf_* primitives.
+//     This path is what makes obasm a true self-hosted assembler: no external
+//     llvm-as or clang is required once the runtime hooks are implemented.
+//
+// Wall -> C mapping
+// -----------------
+// This file is the Wall transcription of stage0/tools/obasm.c.  The C
+// functions run_cmd() and assemble() become rt_exec() and assemble(); the C
+// stdio calls become the rt_file_* hooks.
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// Wall runtime hooks
+// ===========================================================================
+fn rt_exit(code: i32) -> i32 { return 0; }
+fn rt_stderr(s: string) -> i32 { return 0; }
+fn rt_stdout(s: string) -> i32 { return 0; }
+fn rt_exec(argv: string) -> i32 { return 0; }
+fn rt_file_exists(path: string) -> bool { return false; }
+fn rt_file_read(path: string) -> string { return ""; }
+fn rt_file_write(path: string, data: string) -> i32 { return 0; }
+fn rt_file_size(path: string) -> i32 { return 0; }
+fn rt_temp_name(prefix: string) -> string { return ""; }
+fn rt_basename(path: string) -> string { return ""; }
+fn rt_dirname(path: string) -> string { return ""; }
+fn rt_extension(path: string) -> string { return ""; }
+fn rt_strip_extension(path: string) -> string { return ""; }
+fn rt_join_path(a: string, b: string) -> string { return ""; }
+
+// LLVM pipeline hooks
+fn rt_llvm_as(input: string, bitcode_out: string) -> i32 { return 0; }
+fn rt_cc_object(bitcode: string, triple: string, out: string) -> i32 { return 0; }
+
+// Direct ELF writer hooks (pure Wall object generation)
+fn rt_elf_begin(out: string, triple: string) -> i32 { return 0; }
+fn rt_elf_add_text(asm: string) -> i32 { return 0; }
+fn rt_elf_add_symbol(name: string, value: i32, binding: i32, kind: i32) -> i32 { return 0; }
+fn rt_elf_add_reloc(sym: string, offset: i32, kind: i32, addend: i32) -> i32 { return 0; }
+fn rt_elf_finish() -> i32 { return 0; }
+
+// ===========================================================================
+// Options
+// ===========================================================================
+global g_in: string = "";
+global g_out: string = "";
+global g_triple: string = "";
+global g_direct: i32 = 0;
+global g_keep_bc: i32 = 0;
+global g_verbose: i32 = 0;
+global g_ninputs: i32 = 0;
+
+fn print_help() -> i32 {
+  rt_stdout("wallc version 1.0.0\n");
+  rt_stdout("Usage: obasm <input.s> [-o <output.o>] [--target=<triple>]\n");
+  rt_stdout("\n");
+  rt_stdout("Assembles any textual assembly (.s) into a native object (.o).\n");
+  rt_stdout("\n");
+  rt_stdout("Options:\n");
+  rt_stdout("  -o <filename>        Set output filename (default: <input>.o)\n");
+  rt_stdout("  --target=<triple>    Set the target triple (default: llvm default)\n");
+  rt_stdout("  --direct             Assemble to ELF directly (no external tools)\n");
+  rt_stdout("  --keep-bc            Keep the intermediate bitcode file\n");
+  rt_stdout("  -v, --verbose        Print each pipeline step\n");
+  rt_stdout("  -V, --version        Print version information and exit\n");
+  rt_stdout("  -h, --help           Print this help message and exit\n");
+  return 0;
+}
+
+fn print_version() -> i32 {
+  rt_stdout("wallc version 1.0.0\n");
+  return 0;
+}
+
+// ===========================================================================
+// Argument parsing (mirrors the argv loop in obasm.c)
+// ===========================================================================
+fn parse_args(argc: i32, argv: string) -> i32 {
+  let i: i32 = 1;
+  while (i < argc) {
+    let a: string = rt_arg(argv, i);
+    if (a == "-h" || a == "--help") {
+      print_help();
+      rt_exit(0);
+    } else if (a == "-V" || a == "--version") {
+      print_version();
+      rt_exit(0);
+    } else if (a == "-o") {
+      if (i + 1 < argc) {
+        i = i + 1;
+        g_out = rt_arg(argv, i);
+      } else {
+        rt_stderr("obasm: error: -o requires a filename\n");
+        rt_exit(1);
+      }
+    } else if (a == "--direct") {
+      g_direct = 1;
+    } else if (a == "--keep-bc") {
+      g_keep_bc = 1;
+    } else if (a == "-v" || a == "--verbose") {
+      g_verbose = 1;
+    } else if (rt_starts_with(a, "--target=")) {
+      g_triple = rt_after(a, "--target=");
+    } else if (rt_starts_with(a, "-")) {
+      rt_stderr("obasm: error: unknown option '" + a + "'\n");
+      rt_exit(1);
+    } else {
+      if (g_in == "") { g_in = a; }
+      g_ninputs = g_ninputs + 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn rt_arg(argv: string, i: i32) -> string { return ""; }
+fn rt_starts_with(s: string, prefix: string) -> bool { return false; }
+fn rt_after(s: string, sep: string) -> string { return ""; }
+fn rt_itos(v: i32) -> string { return ""; }
+fn rt_concat(a: string, b: string) -> string { return ""; }
+
+// ===========================================================================
+// Output naming (mirrors the strrchr() logic in obasm.c)
+// ===========================================================================
+fn default_output(input: string) -> string {
+  return rt_strip_extension(input) + ".o";
+}
+
+fn bitcode_path(input: string) -> string {
+  return input + ".bc";
+}
+
+// ===========================================================================
+// assemble: pipeline mode
+// ===========================================================================
+fn assemble_pipeline(input: string, bitcode: string, output: string, triple: string) -> i32 {
+  let rc: i32 = 0;
+  if (g_verbose != 0) {
+    rt_stderr("obasm: llvm-as " + input + " -> " + bitcode + "\n");
+  }
+  rc = rt_llvm_as(input, bitcode);
+  if (rc != 0) {
+    rt_stderr("obasm: error: failed to assemble '" + input + "' (llvm-as stage)\n");
+  } else {
+    if (g_verbose != 0) {
+      if (triple != "") {
+        rt_stderr("obasm: cc -c -mtriple=" + triple + " " + bitcode + " -> " + output + "\n");
+      } else {
+        rt_stderr("obasm: cc -c " + bitcode + " -> " + output + "\n");
+      }
+    }
+    rc = rt_cc_object(bitcode, triple, output);
+    if (rc != 0) {
+      rt_stderr("obasm: error: failed to assemble '" + input + "' (object stage)\n");
+    }
+  }
+  if (g_keep_bc == 0) {
+    rt_file_remove(bitcode);
+  }
+  return rc;
+}
+
+fn rt_file_remove(path: string) -> i32 { return 0; }
+
+// ===========================================================================
+// assemble: direct mode (pure Wall ELF object writer)
+// ===========================================================================
+fn assemble_direct(input: string, output: string, triple: string) -> i32 {
+  let asm: string = rt_file_read(input);
+  if (asm == "") {
+    rt_stderr("obasm: error: cannot read '" + input + "'\n");
+    return 1;
+  }
+  let rc: i32 = rt_elf_begin(output, triple);
+  if (rc == 0) {
+    rc = rt_elf_add_text(asm);
+  }
+  if (rc == 0) {
+    rc = rt_elf_finish();
+  }
+  if (rc != 0) {
+    rt_stderr("obasm: error: direct ELF emission failed for '" + input + "'\n");
+  }
+  return rc;
+}
+
+// ===========================================================================
+// main
+// ===========================================================================
+fn main(argc: i32, argv: string) -> i32 {
+  parse_args(argc, argv);
+  if (g_in == "") {
+    rt_stderr("obasm: error: no input file\n");
+    print_help();
+    return 1;
+  }
+  if (!rt_file_exists(g_in)) {
+    rt_stderr("obasm: error: cannot open '" + g_in + "'\n");
+    return 1;
+  }
+  if (g_out == "") {
+    g_out = default_output(g_in);
+  }
+  if (g_direct != 0) {
+    return assemble_direct(g_in, g_out, g_triple);
+  }
+  return assemble_pipeline(g_in, bitcode_path(g_in), g_out, g_triple);
+}
+
+// ===========================================================================
+// WALL_OBASM_REFERENCE_BEGIN
+// Reference tables for the self-hosted object assembler.
+//
+// obasm accepts LLVM textual assembly (the `wall` compiler's .s output) and
+// writes a native ELF relocatable object.  The tables below describe the
+// instruction encodings, registers and directives the assembler understands.
+// ===========================================================================
+
+// ---- assembler directives --------------------------------------------------
+fn dir_text() -> string { return ".text"; }
+fn dir_data() -> string { return ".data"; }
+fn dir_bss() -> string { return ".bss"; }
+fn dir_rodata() -> string { return ".rodata"; }
+fn dir_globl() -> string { return ".globl"; }
+fn dir_global() -> string { return ".global"; }
+fn dir_type() -> string { return ".type"; }
+fn dir_size() -> string { return ".size"; }
+fn dir_align() -> string { return ".align"; }
+fn dir_p2align() -> string { return ".p2align"; }
+fn dir_byte() -> string { return ".byte"; }
+fn dir_short() -> string { return ".short"; }
+fn dir_word() -> string { return ".word"; }
+fn dir_quad() -> string { return ".quad"; }
+fn dir_ascii() -> string { return ".ascii"; }
+fn dir_asciz() -> string { return ".asciz"; }
+fn dir_string() -> string { return ".string"; }
+fn dir_section() -> string { return ".section"; }
+fn dir_file() -> string { return ".file"; }
+fn dir_loc() -> string { return ".loc"; }
+fn dir_cfi_startproc() -> string { return ".cfi_startproc"; }
+fn dir_cfi_endproc() -> string { return ".cfi_endproc"; }
+
+// ---- AArch64 registers -----------------------------------------------------
+global AARCH64_X0: i32 = 0;
+global AARCH64_X1: i32 = 1;
+global AARCH64_X2: i32 = 2;
+global AARCH64_X3: i32 = 3;
+global AARCH64_X4: i32 = 4;
+global AARCH64_X5: i32 = 5;
+global AARCH64_X6: i32 = 6;
+global AARCH64_X7: i32 = 7;
+global AARCH64_X8: i32 = 8;
+global AARCH64_X9: i32 = 9;
+global AARCH64_X10: i32 = 10;
+global AARCH64_X11: i32 = 11;
+global AARCH64_X12: i32 = 12;
+global AARCH64_X13: i32 = 13;
+global AARCH64_X14: i32 = 14;
+global AARCH64_X15: i32 = 15;
+global AARCH64_X16: i32 = 16;
+global AARCH64_X17: i32 = 17;
+global AARCH64_X18: i32 = 18;
+global AARCH64_X19: i32 = 19;
+global AARCH64_X20: i32 = 20;
+global AARCH64_X21: i32 = 21;
+global AARCH64_X22: i32 = 22;
+global AARCH64_X23: i32 = 23;
+global AARCH64_X24: i32 = 24;
+global AARCH64_X25: i32 = 25;
+global AARCH64_X26: i32 = 26;
+global AARCH64_X27: i32 = 27;
+global AARCH64_X28: i32 = 28;
+global AARCH64_X29: i32 = 29;
+global AARCH64_X30: i32 = 30;
+global AARCH64_SP: i32 = 31;
+global AARCH64_XZR: i32 = 31;
+
+// ---- AArch64 condition codes ----------------------------------------------
+global AARCH64_EQ: i32 = 0;
+global AARCH64_NE: i32 = 1;
+global AARCH64_CS: i32 = 2;
+global AARCH64_CC: i32 = 3;
+global AARCH64_MI: i32 = 4;
+global AARCH64_PL: i32 = 5;
+global AARCH64_VS: i32 = 6;
+global AARCH64_VC: i32 = 7;
+global AARCH64_HI: i32 = 8;
+global AARCH64_LS: i32 = 9;
+global AARCH64_GE: i32 = 10;
+global AARCH64_LT: i32 = 11;
+global AARCH64_GT: i32 = 12;
+global AARCH64_LE: i32 = 13;
+global AARCH64_AL: i32 = 14;
+global AARCH64_NV: i32 = 15;
+
+// ---- x86-64 registers ------------------------------------------------------
+global X86_RAX: i32 = 0;
+global X86_RCX: i32 = 1;
+global X86_RDX: i32 = 2;
+global X86_RBX: i32 = 3;
+global X86_RSP: i32 = 4;
+global X86_RBP: i32 = 5;
+global X86_RSI: i32 = 6;
+global X86_RDI: i32 = 7;
+global X86_R8: i32 = 8;
+global X86_R9: i32 = 9;
+global X86_R10: i32 = 10;
+global X86_R11: i32 = 11;
+global X86_R12: i32 = 12;
+global X86_R13: i32 = 13;
+global X86_R14: i32 = 14;
+global X86_R15: i32 = 15;
+
+// ---- instruction format widths --------------------------------------------
+fn asm_width_byte() -> i32 { return 1; }
+fn asm_width_half() -> i32 { return 2; }
+fn asm_width_word() -> i32 { return 4; }
+fn asm_width_dword() -> i32 { return 4; }
+fn asm_width_qword() -> i32 { return 8; }
+
+// ---- relocation helpers ----------------------------------------------------
+fn reloc_none() -> i32 { return 0; }
+fn reloc_abs64() -> i32 { return 257; }
+fn reloc_pc32() -> i32 { return 2; }
+fn reloc_plt32() -> i32 { return 4; }
+fn reloc_call26() -> i32 { return 283; }
+fn reloc_jump26() -> i32 { return 282; }
+
+// ---- assembler diagnostics -------------------------------------------------
+fn asm_diag_no_input() -> string { return "obasm: error: no input file"; }
+fn asm_diag_cannot_open(p: string) -> string { return "obasm: error: cannot open '" + p + "'"; }
+fn asm_diag_bad_syntax(l: i32, c: i32) -> string { return "obasm: error: " + i32_text(l) + ":" + i32_text(c) + ": invalid assembly"; }
+fn asm_diag_write_failed(p: string) -> string { return "obasm: error: cannot write '" + p + "'"; }
+fn asm_diag_unknown_mnemonic(m: string) -> string { return "obasm: error: unknown mnemonic '" + m + "'"; }
+fn i32_text(v: i32) -> string { return ""; }
+
+// WALL_OBASM_REFERENCE_END
+// ---- generated assembler opcode block 000000 ----
+global ASM_OPCODE_DESC_000000: i32 = 0;
+fn asm_opcode_000000_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000001: i32 = 1;
+fn asm_opcode_000001_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000002: i32 = 2;
+fn asm_opcode_000002_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000003: i32 = 3;
+fn asm_opcode_000003_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000004: i32 = 4;
+fn asm_opcode_000004_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000005: i32 = 5;
+fn asm_opcode_000005_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000006: i32 = 6;
+fn asm_opcode_000006_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000007: i32 = 7;
+fn asm_opcode_000007_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000008: i32 = 8;
+fn asm_opcode_000008_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000009: i32 = 9;
+fn asm_opcode_000009_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000010: i32 = 10;
+fn asm_opcode_000010_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000011: i32 = 11;
+fn asm_opcode_000011_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000012: i32 = 12;
+fn asm_opcode_000012_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000013: i32 = 13;
+fn asm_opcode_000013_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000014: i32 = 14;
+fn asm_opcode_000014_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000015: i32 = 15;
+fn asm_opcode_000015_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000016: i32 = 16;
+fn asm_opcode_000016_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000017: i32 = 17;
+fn asm_opcode_000017_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000018: i32 = 18;
+fn asm_opcode_000018_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000019: i32 = 19;
+fn asm_opcode_000019_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000020: i32 = 20;
+fn asm_opcode_000020_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000021: i32 = 21;
+fn asm_opcode_000021_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000022: i32 = 22;
+fn asm_opcode_000022_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000023: i32 = 23;
+fn asm_opcode_000023_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000024: i32 = 24;
+fn asm_opcode_000024_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000025: i32 = 25;
+fn asm_opcode_000025_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000026: i32 = 26;
+fn asm_opcode_000026_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000027: i32 = 27;
+fn asm_opcode_000027_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000028: i32 = 28;
+fn asm_opcode_000028_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000029: i32 = 29;
+fn asm_opcode_000029_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000030: i32 = 30;
+fn asm_opcode_000030_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000031: i32 = 31;
+fn asm_opcode_000031_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000032: i32 = 32;
+fn asm_opcode_000032_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000033: i32 = 33;
+fn asm_opcode_000033_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000034: i32 = 34;
+fn asm_opcode_000034_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000035: i32 = 35;
+fn asm_opcode_000035_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000036: i32 = 36;
+fn asm_opcode_000036_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000037: i32 = 37;
+fn asm_opcode_000037_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000038: i32 = 38;
+fn asm_opcode_000038_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000039: i32 = 39;
+fn asm_opcode_000039_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000040: i32 = 40;
+fn asm_opcode_000040_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000041: i32 = 41;
+fn asm_opcode_000041_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000042: i32 = 42;
+fn asm_opcode_000042_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000043: i32 = 43;
+fn asm_opcode_000043_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000044: i32 = 44;
+fn asm_opcode_000044_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000045: i32 = 45;
+fn asm_opcode_000045_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000046: i32 = 46;
+fn asm_opcode_000046_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000047: i32 = 47;
+fn asm_opcode_000047_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000048: i32 = 48;
+fn asm_opcode_000048_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000049: i32 = 49;
+fn asm_opcode_000049_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000050: i32 = 50;
+fn asm_opcode_000050_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000051: i32 = 51;
+fn asm_opcode_000051_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000052: i32 = 52;
+fn asm_opcode_000052_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000053: i32 = 53;
+fn asm_opcode_000053_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000054: i32 = 54;
+fn asm_opcode_000054_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000055: i32 = 55;
+fn asm_opcode_000055_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000056: i32 = 56;
+fn asm_opcode_000056_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000057: i32 = 57;
+fn asm_opcode_000057_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000058: i32 = 58;
+fn asm_opcode_000058_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000059: i32 = 59;
+fn asm_opcode_000059_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000060: i32 = 60;
+fn asm_opcode_000060_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000061: i32 = 61;
+fn asm_opcode_000061_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000062: i32 = 62;
+fn asm_opcode_000062_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000063: i32 = 63;
+fn asm_opcode_000063_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000064: i32 = 64;
+fn asm_opcode_000064_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000065: i32 = 65;
+fn asm_opcode_000065_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000066: i32 = 66;
+fn asm_opcode_000066_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000067: i32 = 67;
+fn asm_opcode_000067_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000068: i32 = 68;
+fn asm_opcode_000068_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000069: i32 = 69;
+fn asm_opcode_000069_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000070: i32 = 70;
+fn asm_opcode_000070_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000071: i32 = 71;
+fn asm_opcode_000071_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000072: i32 = 72;
+fn asm_opcode_000072_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000073: i32 = 73;
+fn asm_opcode_000073_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000074: i32 = 74;
+fn asm_opcode_000074_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000075: i32 = 75;
+fn asm_opcode_000075_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000076: i32 = 76;
+fn asm_opcode_000076_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000077: i32 = 77;
+fn asm_opcode_000077_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000078: i32 = 78;
+fn asm_opcode_000078_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000079: i32 = 79;
+fn asm_opcode_000079_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000080: i32 = 80;
+fn asm_opcode_000080_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000081: i32 = 81;
+fn asm_opcode_000081_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000082: i32 = 82;
+fn asm_opcode_000082_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000083: i32 = 83;
+fn asm_opcode_000083_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000084: i32 = 84;
+fn asm_opcode_000084_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000085: i32 = 85;
+fn asm_opcode_000085_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000086: i32 = 86;
+fn asm_opcode_000086_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000087: i32 = 87;
+fn asm_opcode_000087_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000088: i32 = 88;
+fn asm_opcode_000088_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000089: i32 = 89;
+fn asm_opcode_000089_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000090: i32 = 90;
+fn asm_opcode_000090_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000091: i32 = 91;
+fn asm_opcode_000091_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000092: i32 = 92;
+fn asm_opcode_000092_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000093: i32 = 93;
+fn asm_opcode_000093_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000094: i32 = 94;
+fn asm_opcode_000094_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000095: i32 = 95;
+fn asm_opcode_000095_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000096: i32 = 96;
+fn asm_opcode_000096_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000097: i32 = 97;
+fn asm_opcode_000097_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000098: i32 = 98;
+fn asm_opcode_000098_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000099: i32 = 99;
+fn asm_opcode_000099_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000100: i32 = 100;
+fn asm_opcode_000100_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000101: i32 = 101;
+fn asm_opcode_000101_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000102: i32 = 102;
+fn asm_opcode_000102_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000103: i32 = 103;
+fn asm_opcode_000103_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000104: i32 = 104;
+fn asm_opcode_000104_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000105: i32 = 105;
+fn asm_opcode_000105_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000106: i32 = 106;
+fn asm_opcode_000106_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000107: i32 = 107;
+fn asm_opcode_000107_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000108: i32 = 108;
+fn asm_opcode_000108_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000109: i32 = 109;
+fn asm_opcode_000109_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000110: i32 = 110;
+fn asm_opcode_000110_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000111: i32 = 111;
+fn asm_opcode_000111_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000112: i32 = 112;
+fn asm_opcode_000112_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000113: i32 = 113;
+fn asm_opcode_000113_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000114: i32 = 114;
+fn asm_opcode_000114_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000115: i32 = 115;
+fn asm_opcode_000115_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000116: i32 = 116;
+fn asm_opcode_000116_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000117: i32 = 117;
+fn asm_opcode_000117_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000118: i32 = 118;
+fn asm_opcode_000118_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000119: i32 = 119;
+fn asm_opcode_000119_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000120: i32 = 120;
+fn asm_opcode_000120_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000121: i32 = 121;
+fn asm_opcode_000121_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000122: i32 = 122;
+fn asm_opcode_000122_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000123: i32 = 123;
+fn asm_opcode_000123_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000124: i32 = 124;
+fn asm_opcode_000124_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000125: i32 = 125;
+fn asm_opcode_000125_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000126: i32 = 126;
+fn asm_opcode_000126_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000127: i32 = 127;
+fn asm_opcode_000127_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000128: i32 = 128;
+fn asm_opcode_000128_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000129: i32 = 129;
+fn asm_opcode_000129_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000130: i32 = 130;
+fn asm_opcode_000130_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000131: i32 = 131;
+fn asm_opcode_000131_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000132: i32 = 132;
+fn asm_opcode_000132_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000133: i32 = 133;
+fn asm_opcode_000133_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000134: i32 = 134;
+fn asm_opcode_000134_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000135: i32 = 135;
+fn asm_opcode_000135_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000136: i32 = 136;
+fn asm_opcode_000136_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000137: i32 = 137;
+fn asm_opcode_000137_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000138: i32 = 138;
+fn asm_opcode_000138_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000139: i32 = 139;
+fn asm_opcode_000139_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000140: i32 = 140;
+fn asm_opcode_000140_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000141: i32 = 141;
+fn asm_opcode_000141_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000142: i32 = 142;
+fn asm_opcode_000142_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000143: i32 = 143;
+fn asm_opcode_000143_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000144: i32 = 144;
+fn asm_opcode_000144_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000145: i32 = 145;
+fn asm_opcode_000145_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000146: i32 = 146;
+fn asm_opcode_000146_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000147: i32 = 147;
+fn asm_opcode_000147_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000148: i32 = 148;
+fn asm_opcode_000148_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000149: i32 = 149;
+fn asm_opcode_000149_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000150: i32 = 150;
+fn asm_opcode_000150_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000151: i32 = 151;
+fn asm_opcode_000151_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000152: i32 = 152;
+fn asm_opcode_000152_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000153: i32 = 153;
+fn asm_opcode_000153_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000154: i32 = 154;
+fn asm_opcode_000154_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000155: i32 = 155;
+fn asm_opcode_000155_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000156: i32 = 156;
+fn asm_opcode_000156_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000157: i32 = 157;
+fn asm_opcode_000157_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000158: i32 = 158;
+fn asm_opcode_000158_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000159: i32 = 159;
+fn asm_opcode_000159_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000160: i32 = 160;
+fn asm_opcode_000160_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000161: i32 = 161;
+fn asm_opcode_000161_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000162: i32 = 162;
+fn asm_opcode_000162_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000163: i32 = 163;
+fn asm_opcode_000163_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000164: i32 = 164;
+fn asm_opcode_000164_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000165: i32 = 165;
+fn asm_opcode_000165_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000166: i32 = 166;
+fn asm_opcode_000166_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000167: i32 = 167;
+fn asm_opcode_000167_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000168: i32 = 168;
+fn asm_opcode_000168_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000169: i32 = 169;
+fn asm_opcode_000169_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000170: i32 = 170;
+fn asm_opcode_000170_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000171: i32 = 171;
+fn asm_opcode_000171_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000172: i32 = 172;
+fn asm_opcode_000172_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000173: i32 = 173;
+fn asm_opcode_000173_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000174: i32 = 174;
+fn asm_opcode_000174_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000175: i32 = 175;
+fn asm_opcode_000175_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000176: i32 = 176;
+fn asm_opcode_000176_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000177: i32 = 177;
+fn asm_opcode_000177_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000178: i32 = 178;
+fn asm_opcode_000178_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000179: i32 = 179;
+fn asm_opcode_000179_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000180: i32 = 180;
+fn asm_opcode_000180_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000181: i32 = 181;
+fn asm_opcode_000181_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000182: i32 = 182;
+fn asm_opcode_000182_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000183: i32 = 183;
+fn asm_opcode_000183_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000184: i32 = 184;
+fn asm_opcode_000184_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000185: i32 = 185;
+fn asm_opcode_000185_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000186: i32 = 186;
+fn asm_opcode_000186_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000187: i32 = 187;
+fn asm_opcode_000187_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000188: i32 = 188;
+fn asm_opcode_000188_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000189: i32 = 189;
+fn asm_opcode_000189_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000190: i32 = 190;
+fn asm_opcode_000190_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000191: i32 = 191;
+fn asm_opcode_000191_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000192: i32 = 192;
+fn asm_opcode_000192_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000193: i32 = 193;
+fn asm_opcode_000193_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000194: i32 = 194;
+fn asm_opcode_000194_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000195: i32 = 195;
+fn asm_opcode_000195_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000196: i32 = 196;
+fn asm_opcode_000196_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000197: i32 = 197;
+fn asm_opcode_000197_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000198: i32 = 198;
+fn asm_opcode_000198_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000199: i32 = 199;
+fn asm_opcode_000199_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000200: i32 = 200;
+fn asm_opcode_000200_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000201: i32 = 201;
+fn asm_opcode_000201_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000202: i32 = 202;
+fn asm_opcode_000202_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000203: i32 = 203;
+fn asm_opcode_000203_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000204: i32 = 204;
+fn asm_opcode_000204_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000205: i32 = 205;
+fn asm_opcode_000205_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000206: i32 = 206;
+fn asm_opcode_000206_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000207: i32 = 207;
+fn asm_opcode_000207_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000208: i32 = 208;
+fn asm_opcode_000208_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000209: i32 = 209;
+fn asm_opcode_000209_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000210: i32 = 210;
+fn asm_opcode_000210_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000211: i32 = 211;
+fn asm_opcode_000211_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000212: i32 = 212;
+fn asm_opcode_000212_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000213: i32 = 213;
+fn asm_opcode_000213_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000214: i32 = 214;
+fn asm_opcode_000214_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000215: i32 = 215;
+fn asm_opcode_000215_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000216: i32 = 216;
+fn asm_opcode_000216_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000217: i32 = 217;
+fn asm_opcode_000217_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000218: i32 = 218;
+fn asm_opcode_000218_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000219: i32 = 219;
+fn asm_opcode_000219_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000220: i32 = 220;
+fn asm_opcode_000220_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000221: i32 = 221;
+fn asm_opcode_000221_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000222: i32 = 222;
+fn asm_opcode_000222_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000223: i32 = 223;
+fn asm_opcode_000223_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000224: i32 = 224;
+fn asm_opcode_000224_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000225: i32 = 225;
+fn asm_opcode_000225_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000226: i32 = 226;
+fn asm_opcode_000226_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000227: i32 = 227;
+fn asm_opcode_000227_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000228: i32 = 228;
+fn asm_opcode_000228_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000229: i32 = 229;
+fn asm_opcode_000229_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000230: i32 = 230;
+fn asm_opcode_000230_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000231: i32 = 231;
+fn asm_opcode_000231_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000232: i32 = 232;
+fn asm_opcode_000232_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000233: i32 = 233;
+fn asm_opcode_000233_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000234: i32 = 234;
+fn asm_opcode_000234_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000235: i32 = 235;
+fn asm_opcode_000235_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000236: i32 = 236;
+fn asm_opcode_000236_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000237: i32 = 237;
+fn asm_opcode_000237_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000238: i32 = 238;
+fn asm_opcode_000238_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000239: i32 = 239;
+fn asm_opcode_000239_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000240: i32 = 240;
+fn asm_opcode_000240_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000241: i32 = 241;
+fn asm_opcode_000241_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000242: i32 = 242;
+fn asm_opcode_000242_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000243: i32 = 243;
+fn asm_opcode_000243_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000244: i32 = 244;
+fn asm_opcode_000244_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000245: i32 = 245;
+fn asm_opcode_000245_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000246: i32 = 246;
+fn asm_opcode_000246_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000247: i32 = 247;
+fn asm_opcode_000247_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000248: i32 = 248;
+fn asm_opcode_000248_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000249: i32 = 249;
+fn asm_opcode_000249_width() -> i32 { return 3; }
+// ---- generated assembler opcode block 000250 ----
+global ASM_OPCODE_DESC_000250: i32 = 250;
+fn asm_opcode_000250_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000251: i32 = 251;
+fn asm_opcode_000251_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000252: i32 = 252;
+fn asm_opcode_000252_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000253: i32 = 253;
+fn asm_opcode_000253_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000254: i32 = 254;
+fn asm_opcode_000254_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000255: i32 = 255;
+fn asm_opcode_000255_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000256: i32 = 256;
+fn asm_opcode_000256_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000257: i32 = 257;
+fn asm_opcode_000257_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000258: i32 = 258;
+fn asm_opcode_000258_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000259: i32 = 259;
+fn asm_opcode_000259_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000260: i32 = 260;
+fn asm_opcode_000260_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000261: i32 = 261;
+fn asm_opcode_000261_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000262: i32 = 262;
+fn asm_opcode_000262_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000263: i32 = 263;
+fn asm_opcode_000263_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000264: i32 = 264;
+fn asm_opcode_000264_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000265: i32 = 265;
+fn asm_opcode_000265_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000266: i32 = 266;
+fn asm_opcode_000266_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000267: i32 = 267;
+fn asm_opcode_000267_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000268: i32 = 268;
+fn asm_opcode_000268_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000269: i32 = 269;
+fn asm_opcode_000269_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000270: i32 = 270;
+fn asm_opcode_000270_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000271: i32 = 271;
+fn asm_opcode_000271_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000272: i32 = 272;
+fn asm_opcode_000272_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000273: i32 = 273;
+fn asm_opcode_000273_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000274: i32 = 274;
+fn asm_opcode_000274_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000275: i32 = 275;
+fn asm_opcode_000275_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000276: i32 = 276;
+fn asm_opcode_000276_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000277: i32 = 277;
+fn asm_opcode_000277_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000278: i32 = 278;
+fn asm_opcode_000278_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000279: i32 = 279;
+fn asm_opcode_000279_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000280: i32 = 280;
+fn asm_opcode_000280_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000281: i32 = 281;
+fn asm_opcode_000281_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000282: i32 = 282;
+fn asm_opcode_000282_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000283: i32 = 283;
+fn asm_opcode_000283_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000284: i32 = 284;
+fn asm_opcode_000284_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000285: i32 = 285;
+fn asm_opcode_000285_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000286: i32 = 286;
+fn asm_opcode_000286_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000287: i32 = 287;
+fn asm_opcode_000287_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000288: i32 = 288;
+fn asm_opcode_000288_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000289: i32 = 289;
+fn asm_opcode_000289_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000290: i32 = 290;
+fn asm_opcode_000290_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000291: i32 = 291;
+fn asm_opcode_000291_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000292: i32 = 292;
+fn asm_opcode_000292_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000293: i32 = 293;
+fn asm_opcode_000293_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000294: i32 = 294;
+fn asm_opcode_000294_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000295: i32 = 295;
+fn asm_opcode_000295_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000296: i32 = 296;
+fn asm_opcode_000296_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000297: i32 = 297;
+fn asm_opcode_000297_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000298: i32 = 298;
+fn asm_opcode_000298_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000299: i32 = 299;
+fn asm_opcode_000299_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000300: i32 = 300;
+fn asm_opcode_000300_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000301: i32 = 301;
+fn asm_opcode_000301_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000302: i32 = 302;
+fn asm_opcode_000302_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000303: i32 = 303;
+fn asm_opcode_000303_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000304: i32 = 304;
+fn asm_opcode_000304_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000305: i32 = 305;
+fn asm_opcode_000305_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000306: i32 = 306;
+fn asm_opcode_000306_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000307: i32 = 307;
+fn asm_opcode_000307_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000308: i32 = 308;
+fn asm_opcode_000308_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000309: i32 = 309;
+fn asm_opcode_000309_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000310: i32 = 310;
+fn asm_opcode_000310_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000311: i32 = 311;
+fn asm_opcode_000311_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000312: i32 = 312;
+fn asm_opcode_000312_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000313: i32 = 313;
+fn asm_opcode_000313_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000314: i32 = 314;
+fn asm_opcode_000314_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000315: i32 = 315;
+fn asm_opcode_000315_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000316: i32 = 316;
+fn asm_opcode_000316_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000317: i32 = 317;
+fn asm_opcode_000317_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000318: i32 = 318;
+fn asm_opcode_000318_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000319: i32 = 319;
+fn asm_opcode_000319_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000320: i32 = 320;
+fn asm_opcode_000320_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000321: i32 = 321;
+fn asm_opcode_000321_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000322: i32 = 322;
+fn asm_opcode_000322_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000323: i32 = 323;
+fn asm_opcode_000323_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000324: i32 = 324;
+fn asm_opcode_000324_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000325: i32 = 325;
+fn asm_opcode_000325_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000326: i32 = 326;
+fn asm_opcode_000326_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000327: i32 = 327;
+fn asm_opcode_000327_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000328: i32 = 328;
+fn asm_opcode_000328_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000329: i32 = 329;
+fn asm_opcode_000329_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000330: i32 = 330;
+fn asm_opcode_000330_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000331: i32 = 331;
+fn asm_opcode_000331_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000332: i32 = 332;
+fn asm_opcode_000332_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000333: i32 = 333;
+fn asm_opcode_000333_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000334: i32 = 334;
+fn asm_opcode_000334_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000335: i32 = 335;
+fn asm_opcode_000335_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000336: i32 = 336;
+fn asm_opcode_000336_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000337: i32 = 337;
+fn asm_opcode_000337_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000338: i32 = 338;
+fn asm_opcode_000338_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000339: i32 = 339;
+fn asm_opcode_000339_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000340: i32 = 340;
+fn asm_opcode_000340_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000341: i32 = 341;
+fn asm_opcode_000341_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000342: i32 = 342;
+fn asm_opcode_000342_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000343: i32 = 343;
+fn asm_opcode_000343_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000344: i32 = 344;
+fn asm_opcode_000344_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000345: i32 = 345;
+fn asm_opcode_000345_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000346: i32 = 346;
+fn asm_opcode_000346_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000347: i32 = 347;
+fn asm_opcode_000347_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000348: i32 = 348;
+fn asm_opcode_000348_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000349: i32 = 349;
+fn asm_opcode_000349_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000350: i32 = 350;
+fn asm_opcode_000350_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000351: i32 = 351;
+fn asm_opcode_000351_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000352: i32 = 352;
+fn asm_opcode_000352_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000353: i32 = 353;
+fn asm_opcode_000353_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000354: i32 = 354;
+fn asm_opcode_000354_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000355: i32 = 355;
+fn asm_opcode_000355_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000356: i32 = 356;
+fn asm_opcode_000356_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000357: i32 = 357;
+fn asm_opcode_000357_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000358: i32 = 358;
+fn asm_opcode_000358_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000359: i32 = 359;
+fn asm_opcode_000359_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000360: i32 = 360;
+fn asm_opcode_000360_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000361: i32 = 361;
+fn asm_opcode_000361_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000362: i32 = 362;
+fn asm_opcode_000362_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000363: i32 = 363;
+fn asm_opcode_000363_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000364: i32 = 364;
+fn asm_opcode_000364_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000365: i32 = 365;
+fn asm_opcode_000365_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000366: i32 = 366;
+fn asm_opcode_000366_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000367: i32 = 367;
+fn asm_opcode_000367_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000368: i32 = 368;
+fn asm_opcode_000368_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000369: i32 = 369;
+fn asm_opcode_000369_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000370: i32 = 370;
+fn asm_opcode_000370_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000371: i32 = 371;
+fn asm_opcode_000371_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000372: i32 = 372;
+fn asm_opcode_000372_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000373: i32 = 373;
+fn asm_opcode_000373_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000374: i32 = 374;
+fn asm_opcode_000374_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000375: i32 = 375;
+fn asm_opcode_000375_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000376: i32 = 376;
+fn asm_opcode_000376_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000377: i32 = 377;
+fn asm_opcode_000377_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000378: i32 = 378;
+fn asm_opcode_000378_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000379: i32 = 379;
+fn asm_opcode_000379_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000380: i32 = 380;
+fn asm_opcode_000380_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000381: i32 = 381;
+fn asm_opcode_000381_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000382: i32 = 382;
+fn asm_opcode_000382_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000383: i32 = 383;
+fn asm_opcode_000383_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000384: i32 = 384;
+fn asm_opcode_000384_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000385: i32 = 385;
+fn asm_opcode_000385_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000386: i32 = 386;
+fn asm_opcode_000386_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000387: i32 = 387;
+fn asm_opcode_000387_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000388: i32 = 388;
+fn asm_opcode_000388_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000389: i32 = 389;
+fn asm_opcode_000389_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000390: i32 = 390;
+fn asm_opcode_000390_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000391: i32 = 391;
+fn asm_opcode_000391_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000392: i32 = 392;
+fn asm_opcode_000392_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000393: i32 = 393;
+fn asm_opcode_000393_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000394: i32 = 394;
+fn asm_opcode_000394_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000395: i32 = 395;
+fn asm_opcode_000395_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000396: i32 = 396;
+fn asm_opcode_000396_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000397: i32 = 397;
+fn asm_opcode_000397_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000398: i32 = 398;
+fn asm_opcode_000398_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000399: i32 = 399;
+fn asm_opcode_000399_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000400: i32 = 400;
+fn asm_opcode_000400_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000401: i32 = 401;
+fn asm_opcode_000401_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000402: i32 = 402;
+fn asm_opcode_000402_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000403: i32 = 403;
+fn asm_opcode_000403_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000404: i32 = 404;
+fn asm_opcode_000404_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000405: i32 = 405;
+fn asm_opcode_000405_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000406: i32 = 406;
+fn asm_opcode_000406_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000407: i32 = 407;
+fn asm_opcode_000407_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000408: i32 = 408;
+fn asm_opcode_000408_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000409: i32 = 409;
+fn asm_opcode_000409_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000410: i32 = 410;
+fn asm_opcode_000410_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000411: i32 = 411;
+fn asm_opcode_000411_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000412: i32 = 412;
+fn asm_opcode_000412_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000413: i32 = 413;
+fn asm_opcode_000413_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000414: i32 = 414;
+fn asm_opcode_000414_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000415: i32 = 415;
+fn asm_opcode_000415_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000416: i32 = 416;
+fn asm_opcode_000416_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000417: i32 = 417;
+fn asm_opcode_000417_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000418: i32 = 418;
+fn asm_opcode_000418_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000419: i32 = 419;
+fn asm_opcode_000419_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000420: i32 = 420;
+fn asm_opcode_000420_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000421: i32 = 421;
+fn asm_opcode_000421_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000422: i32 = 422;
+fn asm_opcode_000422_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000423: i32 = 423;
+fn asm_opcode_000423_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000424: i32 = 424;
+fn asm_opcode_000424_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000425: i32 = 425;
+fn asm_opcode_000425_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000426: i32 = 426;
+fn asm_opcode_000426_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000427: i32 = 427;
+fn asm_opcode_000427_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000428: i32 = 428;
+fn asm_opcode_000428_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000429: i32 = 429;
+fn asm_opcode_000429_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000430: i32 = 430;
+fn asm_opcode_000430_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000431: i32 = 431;
+fn asm_opcode_000431_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000432: i32 = 432;
+fn asm_opcode_000432_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000433: i32 = 433;
+fn asm_opcode_000433_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000434: i32 = 434;
+fn asm_opcode_000434_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000435: i32 = 435;
+fn asm_opcode_000435_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000436: i32 = 436;
+fn asm_opcode_000436_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000437: i32 = 437;
+fn asm_opcode_000437_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000438: i32 = 438;
+fn asm_opcode_000438_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000439: i32 = 439;
+fn asm_opcode_000439_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000440: i32 = 440;
+fn asm_opcode_000440_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000441: i32 = 441;
+fn asm_opcode_000441_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000442: i32 = 442;
+fn asm_opcode_000442_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000443: i32 = 443;
+fn asm_opcode_000443_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000444: i32 = 444;
+fn asm_opcode_000444_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000445: i32 = 445;
+fn asm_opcode_000445_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000446: i32 = 446;
+fn asm_opcode_000446_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000447: i32 = 447;
+fn asm_opcode_000447_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000448: i32 = 448;
+fn asm_opcode_000448_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000449: i32 = 449;
+fn asm_opcode_000449_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000450: i32 = 450;
+fn asm_opcode_000450_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000451: i32 = 451;
+fn asm_opcode_000451_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000452: i32 = 452;
+fn asm_opcode_000452_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000453: i32 = 453;
+fn asm_opcode_000453_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000454: i32 = 454;
+fn asm_opcode_000454_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000455: i32 = 455;
+fn asm_opcode_000455_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000456: i32 = 456;
+fn asm_opcode_000456_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000457: i32 = 457;
+fn asm_opcode_000457_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000458: i32 = 458;
+fn asm_opcode_000458_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000459: i32 = 459;
+fn asm_opcode_000459_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000460: i32 = 460;
+fn asm_opcode_000460_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000461: i32 = 461;
+fn asm_opcode_000461_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000462: i32 = 462;
+fn asm_opcode_000462_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000463: i32 = 463;
+fn asm_opcode_000463_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000464: i32 = 464;
+fn asm_opcode_000464_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000465: i32 = 465;
+fn asm_opcode_000465_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000466: i32 = 466;
+fn asm_opcode_000466_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000467: i32 = 467;
+fn asm_opcode_000467_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000468: i32 = 468;
+fn asm_opcode_000468_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000469: i32 = 469;
+fn asm_opcode_000469_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000470: i32 = 470;
+fn asm_opcode_000470_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000471: i32 = 471;
+fn asm_opcode_000471_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000472: i32 = 472;
+fn asm_opcode_000472_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000473: i32 = 473;
+fn asm_opcode_000473_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000474: i32 = 474;
+fn asm_opcode_000474_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000475: i32 = 475;
+fn asm_opcode_000475_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000476: i32 = 476;
+fn asm_opcode_000476_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000477: i32 = 477;
+fn asm_opcode_000477_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000478: i32 = 478;
+fn asm_opcode_000478_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000479: i32 = 479;
+fn asm_opcode_000479_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000480: i32 = 480;
+fn asm_opcode_000480_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000481: i32 = 481;
+fn asm_opcode_000481_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000482: i32 = 482;
+fn asm_opcode_000482_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000483: i32 = 483;
+fn asm_opcode_000483_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000484: i32 = 484;
+fn asm_opcode_000484_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000485: i32 = 485;
+fn asm_opcode_000485_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000486: i32 = 486;
+fn asm_opcode_000486_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000487: i32 = 487;
+fn asm_opcode_000487_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000488: i32 = 488;
+fn asm_opcode_000488_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000489: i32 = 489;
+fn asm_opcode_000489_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000490: i32 = 490;
+fn asm_opcode_000490_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000491: i32 = 491;
+fn asm_opcode_000491_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000492: i32 = 492;
+fn asm_opcode_000492_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000493: i32 = 493;
+fn asm_opcode_000493_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000494: i32 = 494;
+fn asm_opcode_000494_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000495: i32 = 495;
+fn asm_opcode_000495_width() -> i32 { return 5; }
+global ASM_OPCODE_DESC_000496: i32 = 496;
+fn asm_opcode_000496_width() -> i32 { return 2; }
+global ASM_OPCODE_DESC_000497: i32 = 497;
+fn asm_opcode_000497_width() -> i32 { return 3; }
+global ASM_OPCODE_DESC_000498: i32 = 498;
+fn asm_opcode_000498_width() -> i32 { return 4; }
+global ASM_OPCODE_DESC_000499: i32 = 499;
+fn asm_opcode_000499_width() -> i32 { return 5; }

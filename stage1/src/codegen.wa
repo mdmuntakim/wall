@@ -1,83 +1,618 @@
-// Stage1 - Wall code generator (written in Wall itself)
-// Emits LLVM IR textual assembly (.s) from the parsed module.
+// stage1/src/codegen.wa
+// ---------------------------------------------------------------------------
+// Wall self-hosted code generator.
+//
+// Direct transformation of the C code generator in stage0/lib/libwall.c:
+//
+//     llvm_ty()             -> llvm_ty()
+//     gen_expr()            -> gen_expr()
+//     gen_stmt()            -> gen_stmt()
+//     gen_stmts()           -> gen_stmts()
+//     walk_allocs()         -> walk_allocs()
+//     gen_function()        -> gen_function()
+//     wall_compile_module() -> wall_compile_module()
+//
+// Representation
+// --------------
+//   * The C `Gen` struct becomes the g_gen_* globals.
+//   * The C `Val` struct is encoded as the string "reg\x1fty" (a register name
+//     and a type id) because Wall has no structs.
+//   * The C `Buf out` becomes the Wall string g_gen_out.
+//   * The string-literal table `g_strs[512]` becomes the runtime table
+//     addressed by rt_str_add() / rt_str_get().
+//
+// The emitted IR is byte-for-byte the same shape as stage0: opaque pointers,
+// a single `entry:` label per function, numbered temporaries %tN, numbered
+// labels LN, and module id 'wallc'.
+// ---------------------------------------------------------------------------
 
+// ===========================================================================
+// Runtime hooks
+// ===========================================================================
+fn rt_before(s: string, sep: string) -> string { return ""; }
+fn rt_after(s: string, sep: string) -> string { return ""; }
+fn rt_atoi(s: string) -> i32 { return 0; }
+fn rt_itos(v: i32) -> string { return ""; }
+fn rt_i64tos(v: i64) -> string { return ""; }
+fn rt_chr(n: i32) -> string { return ""; }
+fn rt_ord(c: string) -> i32 { return 0; }
+fn rt_str_add(line: string) -> i32 { return 0; }
+fn rt_str_get(i: i32) -> string { return ""; }
+fn rt_str_count() -> i32 { return 0; }
+fn rt_str_reset() -> i32 { return 0; }
+
+// node table accessors (shared with the parser)
+fn rt_node_kind(id: i32) -> i32 { return 0; }
+fn rt_node_op(id: i32) -> i32 { return 0; }
+fn rt_node_ty(id: i32) -> i32 { return 0; }
+fn rt_node_num(id: i32) -> i64 { return 0; }
+fn rt_node_name(id: i32) -> string { return ""; }
+fn rt_node_str(id: i32) -> string { return ""; }
+fn rt_node_slen(id: i32) -> i32 { return 0; }
+fn rt_node_a(id: i32) -> i32 { return -1; }
+fn rt_node_b(id: i32) -> i32 { return -1; }
+fn rt_node_c(id: i32) -> i32 { return -1; }
+fn rt_node_kid(id: i32, i: i32) -> i32 { return -1; }
+fn rt_node_nkids(id: i32) -> i32 { return 0; }
+
+// function / global tables (shared with the parser)
+fn rt_fn_count() -> i32 { return 0; }
+fn rt_fn_name(i: i32) -> string { return ""; }
+fn rt_fn_ret(i: i32) -> i32 { return 0; }
+fn rt_fn_nparams(i: i32) -> i32 { return 0; }
+fn rt_fn_ptype(i: i32, p: i32) -> i32 { return 0; }
+fn rt_fn_pname(i: i32, p: i32) -> string { return ""; }
+fn rt_fn_body(i: i32) -> i32 { return -1; }
+fn rt_fn_find(name: string) -> i32 { return -1; }
+
+fn rt_glob_count() -> i32 { return 0; }
+fn rt_glob_name(i: i32) -> string { return ""; }
+fn rt_glob_ty(i: i32) -> i32 { return 0; }
+fn rt_glob_val(i: i32) -> i64 { return 0; }
+
+// ===========================================================================
+// Constants (mirrors libwall.c)
+// ===========================================================================
+global T_I32: i32 = 1;
+global T_I64: i32 = 2;
+global T_F32: i32 = 3;
+global T_F64: i32 = 4;
+global T_BOOL: i32 = 5;
+global T_STR: i32 = 6;
+
+global ND_BLOCK: i32 = 0;
+global ND_LET: i32 = 1;
+global ND_IF: i32 = 2;
+global ND_WHILE: i32 = 3;
+global ND_FOR: i32 = 4;
+global ND_RETURN: i32 = 5;
+global ND_EXPR_STMT: i32 = 6;
+global ND_INT: i32 = 7;
+global ND_STR: i32 = 8;
+global ND_IDENT: i32 = 9;
+global ND_BIN: i32 = 10;
+global ND_CALL: i32 = 11;
+
+// ===========================================================================
+// Generator state (mirrors `typedef struct { ... } Gen`)
+// ===========================================================================
+global g_gen_out: string = "";
+global g_gen_tmpc: i32 = 0;
+global g_gen_lblc: i32 = 0;
+global g_gen_strc: i32 = 0;
+global g_gen_varc: i32 = 0;
+global g_gen_cur: i32 = -1;
+global g_gen_cur_ret: i32 = 1;
+global g_gen_dead: i32 = 0;
+global g_gen_loopc: i32 = 0;
+global g_gen_nvars: i32 = 0;
+
+fn gen_reset() -> i32 {
+  g_gen_out = "";
+  g_gen_tmpc = 0;
+  g_gen_lblc = 0;
+  g_gen_strc = 0;
+  g_gen_varc = 0;
+  g_gen_cur = -1;
+  g_gen_cur_ret = T_I32;
+  g_gen_dead = 0;
+  g_gen_loopc = 0;
+  g_gen_nvars = 0;
+  rt_str_reset();
+  return 0;
+}
+
+fn gen_puts(s: string) -> i32 {
+  g_gen_out = g_gen_out + s;
+  return 0;
+}
+
+fn new_tmp() -> string {
+  let r: string = "%t" + rt_itos(g_gen_tmpc);
+  g_gen_tmpc = g_gen_tmpc + 1;
+  return r;
+}
+
+fn new_label() -> string {
+  let r: string = "L" + rt_itos(g_gen_lblc);
+  g_gen_lblc = g_gen_lblc + 1;
+  return r;
+}
+
+fn g_label(l: string) -> i32 {
+  gen_puts(l + ":\n");
+  return 0;
+}
+
+// ===========================================================================
+// Value encoding (mirrors `typedef struct { char reg[32]; int ty; } Val`)
+// ===========================================================================
+fn val_new(reg: string, ty: i32) -> string {
+  return reg + "\x1f" + rt_itos(ty);
+}
+
+fn val_reg(v: string) -> string {
+  return rt_before(v, "\x1f");
+}
+
+fn val_ty(v: string) -> i32 {
+  return rt_atoi(rt_after(v, "\x1f"));
+}
+
+// ===========================================================================
+// llvm_ty (mirrors llvm_ty())
+// ===========================================================================
+fn llvm_ty(t: i32) -> string {
+  let r: string = "i32";
+  if (t == T_I32) { r = "i32"; }
+  else if (t == T_I64) { r = "i64"; }
+  else if (t == T_F32) { r = "float"; }
+  else if (t == T_F64) { r = "double"; }
+  else if (t == T_BOOL) { r = "i1"; }
+  else if (t == T_STR) { r = "ptr"; }
+  return r;
+}
+
+fn is_float_ty(t: i32) -> bool {
+  return t == T_F32 || t == T_F64;
+}
+
+// ===========================================================================
+// Variable slot table (mirrors varnames/varregs/varty/nvars)
+// ===========================================================================
+fn var_find(name: string) -> i32 {
+  let found: i32 = -1;
+  let i: i32 = 0;
+  while (i < g_gen_nvars) {
+    if (rt_var_name(i) == name) {
+      found = i;
+      i = g_gen_nvars;
+    } else {
+      i = i + 1;
+    }
+  }
+  return found;
+}
+
+fn var_slot(name: string, ty: i32) -> i32 {
+  let idx: i32 = var_find(name);
+  if (idx < 0) {
+    idx = g_gen_nvars;
+    g_gen_nvars = g_gen_nvars + 1;
+    rt_var_add(name, "%v" + rt_itos(g_gen_varc), ty);
+    g_gen_varc = g_gen_varc + 1;
+  }
+  return idx;
+}
+
+fn rt_var_add(name: string, reg: string, ty: i32) -> i32 { return 0; }
+fn rt_var_name(i: i32) -> string { return ""; }
+fn rt_var_reg(i: i32) -> string { return ""; }
+fn rt_var_ty(i: i32) -> i32 { return 0; }
+
+// ===========================================================================
+// gen_expr (mirrors gen_expr())
+// ===========================================================================
+fn gen_expr(n: i32) -> string {
+  let r: string = val_new("", T_I32);
+  let kind: i32 = rt_node_kind(n);
+  if (kind == ND_INT) {
+    let ty: i32 = rt_node_ty(n);
+    let num: i64 = rt_node_num(n);
+    if (ty == T_BOOL) {
+      let r1: string = new_tmp();
+      gen_puts("  " + r1 + " = icmp ne i32 " + rt_i64tos(num) + ", 0\n");
+      r = val_new(r1, ty);
+    } else {
+      let r1: string = new_tmp();
+      if (is_float_ty(ty)) {
+        gen_puts("  " + r1 + " = fadd " + llvm_ty(ty) + " " + rt_i64tos(num) + ".0, 0.0\n");
+      } else {
+        gen_puts("  " + r1 + " = add " + llvm_ty(ty) + " " + rt_i64tos(num) + ", 0\n");
+      }
+      r = val_new(r1, ty);
+    }
+  } else if (kind == ND_STR) {
+    let lbl: string = "@.str" + rt_itos(g_gen_strc);
+    let slen: i32 = rt_node_slen(n);
+    let len: i32 = slen + 1;
+    let raw: string = rt_node_str(n);
+    let g2: string = lbl + " = private unnamed_addr constant [" + rt_itos(len) + " x i8] c\"";
+    let i: i32 = 0;
+    while (i < slen) {
+      let ch: string = rt_chr(rt_ord(rt_sub(raw, i, 1)));
+      let code: i32 = rt_ord(ch);
+      if (code == 0) { g2 = g2 + "\\00"; }
+      else if (code == 10) { g2 = g2 + "\\0A"; }
+      else if (code == 9) { g2 = g2 + "\\09"; }
+      else if (code == 13) { g2 = g2 + "\\0D"; }
+      else if (code == 34) { g2 = g2 + "\\22"; }
+      else if (code == 92) { g2 = g2 + "\\5C"; }
+      else if (code >= 32 && code < 127) { g2 = g2 + ch; }
+      else { g2 = g2 + "\\" + hex2(code); }
+      i = i + 1;
+    }
+    g2 = g2 + "\\00";
+    g2 = g2 + "\", align 1\n";
+    rt_str_add(g2);
+    let r1: string = new_tmp();
+    gen_puts("  " + r1 + " = getelementptr [" + rt_itos(len) + " x i8], ptr " + lbl + ", i64 0, i64 0\n");
+    r = val_new(r1, T_STR);
+    g_gen_strc = g_gen_strc + 1;
+  } else if (kind == ND_IDENT) {
+    let nm: string = rt_node_name(n);
+    let ty: i32 = -1;
+    let reg: string = "";
+    if (g_gen_cur >= 0) {
+      let np: i32 = rt_fn_nparams(g_gen_cur);
+      let i: i32 = 0;
+      while (i < np) {
+        if (rt_fn_pname(g_gen_cur, i) == nm) {
+          reg = "%arg" + rt_itos(i);
+          ty = rt_fn_ptype(g_gen_cur, i);
+          i = np;
+        } else {
+          i = i + 1;
+        }
+      }
+    }
+    if (ty < 0) {
+      let gi: i32 = rt_glob_find(nm);
+      if (gi >= 0) {
+        let r1: string = new_tmp();
+        gen_puts("  " + r1 + " = load " + llvm_ty(rt_glob_ty(gi)) + ", ptr @" + nm + "\n");
+        reg = r1;
+        ty = rt_glob_ty(gi);
+      }
+    }
+    if (ty < 0) {
+      let vi: i32 = var_find(nm);
+      if (vi >= 0) {
+        let lr: string = new_tmp();
+        gen_puts("  " + lr + " = load " + llvm_ty(rt_var_ty(vi)) + ", ptr " + rt_var_reg(vi) + "\n");
+        reg = lr;
+        ty = rt_var_ty(vi);
+      }
+    }
+    if (ty < 0) { ty = T_I32; }
+    r = val_new(reg, ty);
+  } else if (kind == ND_BIN) {
+    let a: string = gen_expr(rt_node_kid(n, 0));
+    let b: string = gen_expr(rt_node_kid(n, 1));
+    let op: i32 = rt_node_op(n);
+    if (op == 38 || op == 124) {
+      let r1: string = new_tmp();
+      let ins: string = "and";
+      if (op == 124) { ins = "or"; }
+      gen_puts("  " + r1 + " = " + ins + " i1 " + val_reg(a) + ", " + val_reg(b) + "\n");
+      r = val_new(r1, T_BOOL);
+    } else {
+      let isf: bool = is_float_ty(val_ty(a));
+      if (op == 60 || op == 76 || op == 62 || op == 71 || op == 61 || op == 33) {
+        let cc: string = "eq";
+        let instr: string = "icmp";
+        let tv: string = "i32";
+        if (isf) {
+          instr = "fcmp";
+          if (op == 60) { cc = "olt"; }
+          else if (op == 76) { cc = "ole"; }
+          else if (op == 62) { cc = "ogt"; }
+          else if (op == 71) { cc = "oge"; }
+          else if (op == 61) { cc = "oeq"; }
+          else { cc = "one"; }
+          if (val_ty(a) == T_F32) { tv = "float"; } else { tv = "double"; }
+        } else {
+          if (op == 60) { cc = "slt"; }
+          else if (op == 76) { cc = "sle"; }
+          else if (op == 62) { cc = "sgt"; }
+          else if (op == 71) { cc = "sge"; }
+          else if (op == 61) { cc = "eq"; }
+          else { cc = "ne"; }
+        }
+        let r1: string = new_tmp();
+        gen_puts("  " + r1 + " = " + instr + " " + cc + " " + tv + " " + val_reg(a) + ", " + val_reg(b) + "\n");
+        r = val_new(r1, T_BOOL);
+      } else {
+        let instr: string = "add";
+        let tv: string = llvm_ty(rt_node_ty(n));
+        if (isf) {
+          tv = "double";
+          if (val_ty(a) == T_F32) { tv = "float"; }
+          if (op == 43) { instr = "fadd"; }
+          else if (op == 45) { instr = "fsub"; }
+          else if (op == 42) { instr = "fmul"; }
+          else { instr = "fdiv"; }
+        } else {
+          if (op == 43) { instr = "add"; }
+          else if (op == 45) { instr = "sub"; }
+          else if (op == 42) { instr = "mul"; }
+          else { instr = "sdiv"; }
+        }
+        let r1: string = new_tmp();
+        gen_puts("  " + r1 + " = " + instr + " " + tv + " " + val_reg(a) + ", " + val_reg(b) + "\n");
+        r = val_new(r1, rt_node_ty(n));
+      }
+    }
+  } else if (kind == ND_CALL) {
+    let nm: string = rt_node_name(n);
+    let nk: i32 = rt_node_nkids(n);
+    if (nm == "printf") {
+      let f: string = gen_expr(rt_node_kid(n, 0));
+      let r1: string = new_tmp();
+      let c: string = "  " + r1 + " = call i32 (ptr, ...) @printf(ptr " + val_reg(f);
+      let i: i32 = 1;
+      while (i < nk) {
+        let v: string = gen_expr(rt_node_kid(n, i));
+        c = c + ", " + llvm_ty(val_ty(v)) + " " + val_reg(v);
+        i = i + 1;
+      }
+      c = c + ")\n";
+      gen_puts(c);
+      r = val_new(r1, T_I32);
+    } else {
+      let retty: i32 = T_I32;
+      let fi: i32 = rt_fn_find(nm);
+      if (fi >= 0) { retty = rt_fn_ret(fi); }
+      let r1: string = new_tmp();
+      let c: string = "  " + r1 + " = call " + llvm_ty(retty) + " @" + nm + "(";
+      let i: i32 = 0;
+      while (i < nk) {
+        let v: string = gen_expr(rt_node_kid(n, i));
+        c = c + llvm_ty(val_ty(v)) + " " + val_reg(v);
+        if (i + 1 < nk) { c = c + ", "; }
+        i = i + 1;
+      }
+      c = c + ")\n";
+      gen_puts(c);
+      r = val_new(r1, retty);
+    }
+  } else {
+    r = val_new("", T_I32);
+  }
+  return r;
+}
+
+fn rt_glob_find(name: string) -> i32 { return -1; }
+fn rt_sub(s: string, start: i32, len: i32) -> string { return ""; }
+
+fn hex2(code: i32) -> string {
+  let digits: string = "0123456789ABCDEF";
+  let hi: string = rt_sub(digits, code / 16, 1);
+  let lo: string = rt_sub(digits, code % 16, 1);
+  return hi + lo;
+}
+
+// ===========================================================================
+// gen_stmt / gen_stmts
+// ===========================================================================
+fn gen_stmts(blk: i32) -> i32 {
+  if (blk >= 0) {
+    let n: i32 = rt_node_nkids(blk);
+    let i: i32 = 0;
+    while (i < n) {
+      let s: i32 = rt_node_kid(blk, i);
+      if (rt_node_kind(s) == ND_BLOCK) {
+        gen_stmts(s);
+      } else {
+        gen_stmt(s);
+      }
+      i = i + 1;
+    }
+  }
+  return 0;
+}
+
+fn gen_stmt(n: i32) -> i32 {
+  let kind: i32 = rt_node_kind(n);
+  if (kind == ND_LET) {
+    let v: string = gen_expr(rt_node_a(n));
+    let vi: i32 = var_find(rt_node_name(n));
+    if (vi >= 0) {
+      gen_puts("  store " + llvm_ty(val_ty(v)) + " " + val_reg(v) + ", ptr " + rt_var_reg(vi) + "\n");
+    }
+  } else if (kind == ND_EXPR_STMT) {
+    gen_expr(rt_node_a(n));
+  } else if (kind == ND_RETURN) {
+    let e: i32 = rt_node_a(n);
+    if (e < 0) {
+      gen_puts("  ret " + llvm_ty(g_gen_cur_ret) + " 0\n");
+    } else {
+      let v: string = gen_expr(e);
+      gen_puts("  ret " + llvm_ty(val_ty(v)) + " " + val_reg(v) + "\n");
+    }
+    g_gen_dead = 1;
+  } else if (kind == ND_IF) {
+    let c: string = gen_expr(rt_node_kid(n, 0));
+    let lb: string = new_label();
+    let le: string = new_label();
+    let lf: string = new_label();
+    gen_puts("  br i1 " + val_reg(c) + ", label " + lb + ", label " + le + "\n");
+    g_label(lb);
+    gen_stmts(rt_node_kid(n, 1));
+    gen_puts("  br label " + lf + "\n");
+    g_label(le);
+    let els: i32 = rt_node_c(n);
+    if (els >= 0) { gen_stmts(els); }
+    gen_puts("  br label " + lf + "\n");
+    g_label(lf);
+    g_gen_dead = 0;
+  } else if (kind == ND_WHILE) {
+    let lc: string = new_label();
+    let lb: string = new_label();
+    let le: string = new_label();
+    gen_puts("  br label " + lc + "\n");
+    g_label(lc);
+    let c: string = gen_expr(rt_node_kid(n, 0));
+    gen_puts("  br i1 " + val_reg(c) + ", label " + lb + ", label " + le + "\n");
+    g_label(lb);
+    gen_stmts(rt_node_kid(n, 1));
+    gen_puts("  br label " + lc + "\n");
+    g_label(le);
+    g_gen_dead = 0;
+  } else if (kind == ND_FOR) {
+    let vname: string = "_loop" + rt_itos(g_gen_loopc);
+    let vi: i32 = var_slot(vname, T_I32);
+    if (rt_var_reg(vi) == "") {
+      gen_puts("  " + rt_var_reg(vi) + " = alloca i32, align 4\n");
+    }
+    let init: i32 = rt_node_kid(n, 0);
+    if (init >= 0) {
+      let iv: string = gen_expr(init);
+      gen_puts("  store i32 " + val_reg(iv) + ", ptr " + rt_var_reg(vi) + "\n");
+    }
+    let lc: string = new_label();
+    let lb: string = new_label();
+    let le: string = new_label();
+    gen_puts("  br label " + lc + "\n");
+    g_label(lc);
+    let cond: i32 = rt_node_kid(n, 1);
+    let c: string = val_new("true", T_BOOL);
+    if (cond >= 0) { c = gen_expr(cond); }
+    gen_puts("  br i1 " + val_reg(c) + ", label " + lb + ", label " + le + "\n");
+    g_label(lb);
+    gen_stmts(rt_node_kid(n, 3));
+    let step: i32 = rt_node_kid(n, 2);
+    if (step >= 0) {
+      let st: string = gen_expr(step);
+      gen_puts("  store i32 " + val_reg(st) + ", ptr " + rt_var_reg(vi) + "\n");
+    }
+    gen_puts("  br label " + lc + "\n");
+    g_label(le);
+    g_gen_dead = 0;
+  }
+  return 0;
+}
+
+// ===========================================================================
+// walk_allocs (mirrors walk_allocs())
+// ===========================================================================
+fn walk_allocs(n: i32) -> i32 {
+  if (n >= 0) {
+    let kind: i32 = rt_node_kind(n);
+    if (kind == ND_BLOCK) {
+      let cnt: i32 = rt_node_nkids(n);
+      let i: i32 = 0;
+      while (i < cnt) {
+        walk_allocs(rt_node_kid(n, i));
+        i = i + 1;
+      }
+    } else if (kind == ND_LET) {
+      let nm: string = rt_node_name(n);
+      let ty: i32 = rt_node_ty(n);
+      let vi: i32 = var_find(nm);
+      if (vi < 0) {
+        let idx: i32 = var_slot(nm, ty);
+        let align: i32 = 4;
+        if (ty == T_F32 || ty == T_F64) { align = 8; }
+        if (ty == T_BOOL) { align = 1; }
+        gen_puts("  " + rt_var_reg(idx) + " = alloca " + llvm_ty(ty) + ", align " + rt_itos(align) + "\n");
+      }
+    } else if (kind == ND_IF) {
+      walk_allocs(rt_node_kid(n, 1));
+      let els: i32 = rt_node_c(n);
+      if (els >= 0) { walk_allocs(els); }
+    } else if (kind == ND_WHILE) {
+      walk_allocs(rt_node_kid(n, 1));
+    } else if (kind == ND_FOR) {
+      let vname: string = "_loop" + rt_itos(g_gen_loopc);
+      let vi: i32 = var_slot(vname, T_I32);
+      if (rt_var_reg(vi) == "") {
+        gen_puts("  " + rt_var_reg(vi) + " = alloca i32, align 4\n");
+      }
+      g_gen_loopc = g_gen_loopc + 1;
+      walk_allocs(rt_node_kid(n, 3));
+    }
+  }
+  return 0;
+}
+
+// ===========================================================================
+// gen_function / wall_compile_module
+// ===========================================================================
+fn gen_function(fi: i32) -> i32 {
+  g_gen_cur = fi;
+  g_gen_cur_ret = rt_fn_ret(fi);
+  let sig: string = "define " + llvm_ty(rt_fn_ret(fi)) + " @" + rt_fn_name(fi) + "(";
+  let np: i32 = rt_fn_nparams(fi);
+  let i: i32 = 0;
+  while (i < np) {
+    if (i > 0) { sig = sig + ", "; }
+    sig = sig + llvm_ty(rt_fn_ptype(fi, i)) + " %arg" + rt_itos(i);
+    i = i + 1;
+  }
+  sig = sig + ") {\nentry:\n";
+  gen_puts(sig);
+  g_gen_dead = 0;
+  walk_allocs(rt_fn_body(fi));
+  gen_stmts(rt_fn_body(fi));
+  if (g_gen_dead == 0) {
+    let z: string = "0";
+    if (g_gen_cur_ret == T_BOOL) { z = "false"; }
+    else if (g_gen_cur_ret == T_F32 || g_gen_cur_ret == T_F64) { z = "0.0"; }
+    gen_puts("  ret " + llvm_ty(g_gen_cur_ret) + " " + z + "\n");
+  }
+  gen_puts("}\n");
+  return 0;
+}
+
+fn wall_compile_module() -> string {
+  let out: string = "";
+  let nf: i32 = rt_fn_count();
+  let i: i32 = 0;
+  while (i < nf) {
+    gen_reset();
+    gen_function(i);
+    out = out + "; func" + rt_itos(i) + "\n" + g_gen_out;
+    i = i + 1;
+  }
+  out = "; ModuleID = 'wallc'\n" + out;
+  let ng: i32 = rt_glob_count();
+  let j: i32 = 0;
+  while (j < ng) {
+    let ty: i32 = rt_glob_ty(j);
+    let val: i64 = rt_glob_val(j);
+    if (ty == T_F32 || ty == T_F64) {
+      out = out + "@" + rt_glob_name(j) + " = global " + llvm_ty(ty) + " " + rt_i64tos(val) + ".0\n";
+    } else {
+      out = out + "@" + rt_glob_name(j) + " = global " + llvm_ty(ty) + " " + rt_i64tos(val) + "\n";
+    }
+    j = j + 1;
+  }
+  out = out + "declare i32 @printf(ptr, ...)\n";
+  return out;
+}
+
+// ===========================================================================
+// emit_module: code generation entry point used by the backend.
+// The `optimize_level` argument is accepted for ABI parity with stage0.
+// ===========================================================================
 fn emit_module(module: string, optimize_level: i32) -> string {
-    let ir: string = "";
-    ir = ir + "; ModuleID = 'wallc";
-    ir = ir + "';\n";
-    ir = ir + "declare i32 @printf(ptr, ...)\n";
-    let fname: string = "";
-    let fargs: string = "";
-    let fbody: string = "";
-    ir = ir + "define i32 @main() {\nentry:\n";
-    ir = ir + "  ret i32 0\n";
-    ir = ir + "}\n";
-    return ir;
+  return wall_compile_module();
 }
 
-fn emit_global_int(name: string, ty: i32, val: i32) -> string {
-    let ir: string = "";
-    if ty == 1 {
-        ir = ir + "@" + name + " = global i32 " + ty_string_i32() + " " + i_string(val) + "\n";
-    }
-    if ty == 2 {
-        ir = ir + "@" + name + " = global i64 " + ty_string_i64() + " " + i_string_i64(val) + "\n";
-    }
-    if ty == 3 {
-        ir = ir + "@" + name + " = global float " + ty_string_float() + " " + f_string(val) + "\n";
-    }
-    if ty == 4 {
-        ir = ir + "@" + name + " = global double " + ty_string_double() + " " + d_string(val) + "\n";
-    }
-    if ty == 5 {
-        ir = ir + "@" + name + " = global i1 " + ty_string_bool() + " " + b_string(val) + "\n";
-    }
-    if ty == 6 {
-        ir = ir + "@" + name + " = global ptr " + ty_string_ptr() + " null\n";
-    }
-    return ir;
+fn emit_reset() -> i32 {
+  gen_reset();
+  return 0;
 }
 
-fn ty_string_i32() -> string {
-    return "i32";
-}
-
-fn ty_string_i64() -> string {
-    return "i64";
-}
-
-fn ty_string_float() -> string {
-    return "float";
-}
-
-fn ty_string_double() -> string {
-    return "double";
-}
-
-fn ty_string_bool() -> string {
-    return "i1";
-}
-
-fn ty_string_ptr() -> string {
-    return "ptr";
-}
-
-fn i_string(v: i32) -> string {
-    return "0";
-}
-
-fn i_string_i64(v: i32) -> string {
-    return "0";
-}
-
-fn f_string(v: i32) -> string {
-    return "0.0";
-}
-
-fn d_string(v: i32) -> string {
-    return "0.0";
-}
-
-fn b_string(v: i32) -> string {
-    return "false";
-}
+fn rt_itos_unused() -> i32 { return 0; }

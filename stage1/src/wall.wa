@@ -2,14 +2,14 @@
 //
 // Full Wall compiler driver written in the Wall programming language itself.
 
-fn wall_version(buf: string, buflen: i32) -> i32 {
+fn wall_version(buf: string, buflen: int) -> int {
     if buf != null {
-        buf = "wallc version 1.0.0";
+        buf = "wallc version 1.0.0 (285fd1c)";
     }
     return 0;
 }
 
-fn compile_source(source: string, optimize_level: i32, out_ir: string, err: string) -> i32 {
+fn compile_source(source: string, optimize_level: int, out_ir: string, err: string) -> int {
     let tokens: string = lex_all(source);
     let module: string = parse_module(tokens);
     let ir: string = emit_module(module, optimize_level);
@@ -18,6 +18,6 @@ fn compile_source(source: string, optimize_level: i32, out_ir: string, err: stri
     return 0;
 }
 
-fn main() -> i32 {
+fn main() -> int {
     return 0;
 }

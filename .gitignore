@@ -1,6 +1,7 @@
 wall
 libwall.so
 obasm
+linker
 *.o
 *.ll
 *.s
