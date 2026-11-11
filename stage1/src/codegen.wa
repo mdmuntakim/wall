@@ -3,7 +3,7 @@
 
 fn emit_module(module: string, optimize_level: i32) -> string {
     let ir: string = "";
-    ir = ir + "; ModuleID = 'wall";
+    ir = ir + "; ModuleID = 'wallc";
     ir = ir + "';\n";
     ir = ir + "declare i32 @printf(ptr, ...)\n";
     let fname: string = "";

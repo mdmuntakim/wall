@@ -31,7 +31,7 @@ static int assemble(const char *in, const char *bc, const char *out, const char 
 
 static void print_usage(FILE *f) {
   fprintf(f,
-    "obasm 1.0.0\n"
+    "wallc version 1.0.0\n"
     "Usage: obasm <input.s> [-o <output.o>] [--target=<triple>]\n"
     "\n"
     "Assembles LLVM textual assembly into a native object file.\n"

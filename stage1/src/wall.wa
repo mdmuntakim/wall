@@ -4,7 +4,7 @@
 
 fn wall_version(buf: string, buflen: i32) -> i32 {
     if buf != null {
-        buf = "Wall Compiler version 1.0.0";
+        buf = "wallc version 1.0.0";
     }
     return 0;
 }

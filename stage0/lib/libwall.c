@@ -16,7 +16,7 @@
 const char *wall_version_string(void) { return "Wall/1.0.0"; }
 
 int wall_version(char *buf, int buflen) {
-  snprintf(buf, (size_t)buflen, "Wall Compiler version 1.0.0");
+  snprintf(buf, (size_t)buflen, "wallc version 1.0.0");
   return 0;
 }
 
@@ -738,7 +738,7 @@ static void wall_compile_module(Buf *out) {
     gen_function(&g, &g_fns[i]);
     *fb = g.out;
   }
-  buf_puts(out, "; ModuleID = 'wall'\n");
+  buf_puts(out, "; ModuleID = 'wallc'\n");
   for (int i = 0; i < g_nstrs; i++) buf_puts(out, g_strs[i].line);
   for (int i = 0; i < g_nglobs; i++) {
     Buf gb; buf_init(&gb);
