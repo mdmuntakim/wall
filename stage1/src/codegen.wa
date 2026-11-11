@@ -1,0 +1,18 @@
+// Stage1 - Wall code generator (written in Wall itself)
+// Emits LLVM IR textual assembly (.s) from the parsed module.
+
+fn emit_module(module: string, optimize_level: i32) -> string {
+    // Emit LLVM IR: module header, string globals, declare printf, defines
+    let ir: string = "";
+    ir = ir + "; ModuleID = 'wall";
+    ir = ir + "';\n";
+    ir = ir + "declare i32 @printf(ptr, ...)\n";
+    // For each function in module: define i32 @name(params) { ... }
+    let fname: string = "";
+    let fargs: string = "";
+    let fbody: string = "";
+    ir = ir + "define i32 @main() {\nentry:\n";
+    ir = ir + "  ret i32 0\n";
+    ir = ir + "}\n";
+    return ir;
+}

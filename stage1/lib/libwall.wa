@@ -1,0 +1,10 @@
+// Stage1 - Wall compiler backend library (written in Wall itself)
+// Provides the compiler backend ABI used by the wall driver.
+
+fn wall_version(buf: string, buflen: i32) -> i32 {
+    return 0;
+}
+
+fn wall_compile(source: string, optimize_level: i32, out_ir: string, err: string) -> i32 {
+    return compile_source(source, optimize_level, out_ir, err);
+}

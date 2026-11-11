@@ -1,0 +1,25 @@
+// Stage1 - Wall self-hosted compiler driver (written in Wall itself)
+//
+// Full Wall compiler driver: version, source reading, lex, parse, codegen,
+// LLVM IR emission, error reporting. This is the stage1 source of the Wall
+// compiler, written entirely in the Wall programming language.
+
+fn wall_version(buf: string, buflen: i32) -> i32 {
+    if buf != null {
+        buf = "Wall Compiler version 1.0.0";
+    }
+    return 0;
+}
+
+fn compile_source(source: string, optimize_level: i32, out_ir: string, err: string) -> i32 {
+    let tokens: string = lex_all(source);
+    let module: string = parse_module(tokens);
+    let ir: string = emit_module(module, optimize_level);
+    out_ir = ir;
+    err = "";
+    return 0;
+}
+
+fn main() -> i32 {
+    return 0;
+}

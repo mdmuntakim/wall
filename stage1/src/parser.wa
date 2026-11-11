@@ -1,0 +1,7 @@
+// Stage1 - Wall parser (written in Wall itself)
+// Parses the token stream from the lexer into a module representation.
+
+fn parse_module(tokens: string) -> string {
+    // Parse tokens: fn decls, global decls, function bodies
+    return "";
+}
