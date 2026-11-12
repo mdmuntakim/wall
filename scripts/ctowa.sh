@@ -2,8 +2,8 @@
 # ctowa.sh - C to Wall (.wa) source translator.
 #
 # Usage:
-#   tools/ctowa.sh <input.c> [-o output.wa] [--report report.txt]
-#   tools/ctowa.sh --self-test
+#   scripts/ctowa.sh <input.c> [-o output.wa] [--report report.txt]
+#   scripts/ctowa.sh --self-test
 #
 # Translates the C subset that the Wall compiler can express: functions,
 # scalar locals and globals, assignment, compound assignment, ++/--,
@@ -541,7 +541,7 @@ if [ -z "$out" ]; then
 fi
 
 {
-  echo "// Generated from $in by tools/ctowa.sh"
+  echo "// Generated from $in by scripts/ctowa.sh"
   echo "// C -> Wall source transformation."
   echo ""
   translate "$in"

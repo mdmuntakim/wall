@@ -1,0 +1,15 @@
+Package: wall
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Wall Developers <wall@example.invalid>
+Installed-Size: @SIZE@
+Homepage: https://github.com/mdmuntakim/wall
+Description: Wall systems programming language toolchain
+ Wall is a systems programming language that compiles to LLVM IR and
+ ships its own assembler and static ELF linker.
+ .
+ This package installs the wall multicall driver, the merged libwall.so
+ (compiler, assembler and linker), and the wallc, obasm, linker and
+ ld.wall compatibility links in the Termux prefix.

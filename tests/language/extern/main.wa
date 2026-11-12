@@ -1,0 +1,6 @@
+extern global answer: i32;
+
+fn main() -> i32 {
+  printf("%d\n", answer);
+  return 0;
+}

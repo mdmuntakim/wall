@@ -7,7 +7,7 @@
 # instruction opcodes).  This script appends deterministic, uniquely named
 # entries so the files stay stable across regenerations.
 #
-# Usage: tools/gen_wa_tables.sh
+# Usage: scripts/gen_wa_tables.sh
 set -e
 cd "$(dirname "$0")/.."
 
@@ -331,7 +331,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2. No synthetic padding.  linker.wa is the exact ctowa translation of
-#    tools/linker.c, so its size comes from real translated source.
+#    src/linker/linker.c, so its size comes from real translated source.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

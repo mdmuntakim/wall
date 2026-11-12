@@ -1,12 +1,29 @@
-wall
-libwall.so
-obasm
-linker
+# Build products
+/.wallbuild/
+/wall
+/libwall.so
+/wallc
+/obasm
+/linker
+/ld.wall
+
+# Test and package artefacts
+/tests/tmp/
+/wall_*.deb
+/wall-*.tar.*
+*.tar.xz
+
+# Compiler intermediates
 *.o
+*.obj
+*.bc
 *.ll
 *.s
-*.bc
 tmp_*
-build
 hello
 hello_final
+
+# Editors and OS noise
+.DS_Store
+*.swp
+*~

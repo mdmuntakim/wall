@@ -22,7 +22,7 @@
 //
 // Wall -> C mapping
 // -----------------
-// This file is the Wall transcription of stage0/tools/obasm.c.  The C
+// This file is the Wall transcription of src/assembler/obasm.c.  The C
 // functions run_cmd() and assemble() become rt_exec() and assemble(); the C
 // stdio calls become the rt_file_* hooks.
 // ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ global g_verbose: i32 = 0;
 global g_ninputs: i32 = 0;
 
 fn print_help() -> i32 {
-  rt_stdout("wallc version 1.0.0\n");
+  rt_stdout("wall version 1.0.0\n");
   rt_stdout("Usage: obasm <input.s> [-o <output.o>] [--target=<triple>]\n");
   rt_stdout("\n");
   rt_stdout("Assembles any textual assembly (.s) into a native object (.o).\n");
@@ -85,7 +85,7 @@ fn print_help() -> i32 {
 }
 
 fn print_version() -> i32 {
-  rt_stdout("wallc version 1.0.0\n");
+  rt_stdout("wall version 1.0.0\n");
   return 0;
 }
 

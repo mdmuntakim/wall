@@ -1,0 +1,11 @@
+# Wall C sources follow the LLVM style with a two-space indent.
+BasedOnStyle: LLVM
+IndentWidth: 2
+ContinuationIndentWidth: 4
+ColumnLimit: 100
+UseTab: Never
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortFunctionsOnASingleLine: Empty
+SortIncludes: CaseSensitive
+IndentCaseLabels: false

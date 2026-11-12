@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // Wall self-hosted parser.
 //
-// Direct transformation of the C parser in stage0/lib/libwall.c:
+// Direct transformation of the C parser in src/compiler/libwall.c:
 //
 //     parse_type()     -> parse_type()
 //     parse_primary()  -> parse_primary()

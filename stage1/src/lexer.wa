@@ -3,7 +3,7 @@
 // Wall self-hosted lexer.
 //
 // This file is a direct transformation of the C functions in
-// stage0/lib/libwall.c:
+// src/compiler/libwall.c:
 //
 //     lex()               -> lex()
 //     tok_push()          -> tok_push()

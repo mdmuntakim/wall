@@ -1,7 +1,7 @@
 /* wallrt.c - freestanding Wall runtime.
  *
  * This object is linked into every Wall executable by the Wall linker
- * (tools/linker.c).  It contains no libc dependency: every operation is
+ * (src/linker/linker.c).  It contains no libc dependency: every operation is
  * implemented with Linux AArch64 system calls directly.
  *
  * Provided symbols:

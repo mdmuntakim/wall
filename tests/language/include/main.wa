@@ -1,0 +1,6 @@
+include "defs.wa";
+
+fn main() -> i32 {
+  printf("%d\n", answer());
+  return 0;
+}

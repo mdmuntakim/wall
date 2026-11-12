@@ -22,11 +22,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include "runtime_blob.h"
+#include "wall_cli.h"
+#include "wall_log.h"
 
 #ifndef WALL_DEFAULT_COMMENT
-#define WALL_DEFAULT_COMMENT "wallc version 1.0.0 (285fd1c)"
+#define WALL_DEFAULT_COMMENT "wall version 1.0.0"
 #endif
 
 #define MAXSEC 4096
@@ -69,7 +72,7 @@ static void b_reserve(Buf *b, size_t need) {
   size_t c = b->cap ? b->cap : 4096;
   while (c < b->len + need) c *= 2;
   unsigned char *np = (unsigned char *)realloc(b->p, c);
-  if (!np) { fprintf(stderr, "linker: error: out of memory\n"); exit(1); }
+  if (!np) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
   memset(np + b->cap, 0, c - b->cap);
   b->p = np;
   b->cap = c;
@@ -105,6 +108,7 @@ typedef struct {
   int sec_kind[MAXSEC];    /* 0 skip, 1 text, 2 rodata, 3 data, 4 bss */
   size_t sec_off[MAXSEC];
   uint64_t sec_addr[MAXSEC];
+  int execstack;           /* .note.GNU-stack has SHF_EXECINSTR */
 } Obj;
 
 static Obj *g_objs;
@@ -124,7 +128,7 @@ static void undef_add(const char *name) {
   if (g_nundef == g_capundef) {
     g_capundef = g_capundef ? g_capundef * 2 : 64;
     g_undef = (char **)realloc(g_undef, (size_t)g_capundef * sizeof(char *));
-    if (!g_undef) { fprintf(stderr, "linker: error: out of memory\n"); exit(1); }
+    if (!g_undef) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
   }
   g_undef[g_nundef++] = strdup(name);
 }
@@ -163,6 +167,42 @@ static int g_shared;
 static int g_strip = 1;   /* small binaries by default; --symbols keeps symtab */
 static int g_build_id;    /* --build-id */
 
+/* Option state for real GNU ld compatible behaviour. */
+static int g_allow_multiple_definition;
+static int g_define_common = 1;
+static int g_fatal_warnings;
+static int g_no_warnings;
+static int g_trace;
+static int g_stats;
+static int g_print_memory_usage;
+static int g_require_defined;
+static int g_error_execstack;
+static int g_warn_execstack;
+static int g_execstack;
+static int g_no_undefined = 1;
+static int g_warn_unresolved;
+static int g_sort_common = 1;
+static int g_warn_common;
+static int g_print_output_format;
+static int g_had_error;
+static int g_nwarn;
+static char **g_allow_undef;
+static int g_nallow_undef;
+static char **g_required;
+static int g_nrequired;
+static const char *g_oformat;
+static const char *g_sysroot;
+static char **g_libdirs;
+static int g_nlibdirs;
+static const char *g_retain_file;
+static char **g_retain;
+static int g_nretain;
+static char **g_maplines;
+static int g_nmaplines;
+static int g_map_stdout;
+static struct { int whole; int static_mode; int execstack; } g_state_stack[32];
+static int g_nstate_stack;
+
 /* --build-id needs a fourth program header (PT_NOTE): 64 + 4*56 = 288. */
 static uint64_t text_file_off(void) { return g_build_id ? 0x120u : WALL_TEXT_OFF; }
 static const char *g_map_path;
@@ -194,15 +234,15 @@ static int obj_parse(Obj *o) {
   if (o->size < 64) return -1;
   if (o->buf[0] != 0x7f || o->buf[1] != 'E' || o->buf[2] != 'L' || o->buf[3] != 'F') return -1;
   if (o->buf[4] != 2 || o->buf[5] != 1) {
-    fprintf(stderr, "linker: error: '%s' is not a 64-bit little-endian ELF object\n", o->name);
+    WALL_LOGE("linker", "'%s' is not a 64-bit little-endian ELF object\n", o->name);
     return -1;
   }
   if (r16(o->buf + 16) != 1) {
-    fprintf(stderr, "linker: error: '%s' is not a relocatable object\n", o->name);
+    WALL_LOGE("linker", "'%s' is not a relocatable object\n", o->name);
     return -1;
   }
   if (r16(o->buf + 18) != 183) {
-    fprintf(stderr, "linker: error: '%s' is not an AArch64 object\n", o->name);
+    WALL_LOGE("linker", "'%s' is not an AArch64 object\n", o->name);
     return -1;
   }
   o->shoff = r64(o->buf + 40);
@@ -230,7 +270,10 @@ static int obj_parse(Obj *o) {
     }
     if (!strcmp(nm, ".eh_frame") || !strncmp(nm, ".note", 5) ||
         !strcmp(nm, ".comment") || !strcmp(nm, ".llvm_addrsig") ||
-        !strncmp(nm, ".ARM.attributes", 15)) kind = 0;
+        !strncmp(nm, ".ARM.attributes", 15)) {
+      if (!strcmp(nm, ".note.GNU-stack") && (flags & SHF_EXECINSTR)) o->execstack = 1;
+      kind = 0;
+    }
     o->sec_kind[i] = kind;
     o->sec_off[i] = 0;
     o->sec_addr[i] = 0;
@@ -273,7 +316,7 @@ static int add_object(const char *name, const unsigned char *buf, size_t size, i
   if (g_nobjs == g_capobjs) {
     g_capobjs = g_capobjs ? g_capobjs * 2 : 16;
     g_objs = (Obj *)realloc(g_objs, (size_t)g_capobjs * sizeof(Obj));
-    if (!g_objs) { fprintf(stderr, "linker: error: out of memory\n"); exit(1); }
+    if (!g_objs) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
   }
   Obj *o = &g_objs[g_nobjs];
   memset(o, 0, sizeof(*o));
@@ -496,7 +539,7 @@ static int layout_objects(void) {
       uint64_t al = r64(sh + 48);
       if (al < 1) al = 1;
       if (off + sz > o->size && kind != 4) {
-        fprintf(stderr, "linker: error: section out of bounds in '%s'\n", o->name);
+        WALL_LOGE("linker", "section out of bounds in '%s'\n", o->name);
         return -1;
       }
       if (kind == 4) {
@@ -543,11 +586,45 @@ static SymEnt *sym_find(const char *name) {
   return NULL;
 }
 
+static void lwarn(const char *fmt, ...) {
+  if (g_no_warnings) return;
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  WALL_LOGW("linker", "%s\n", buf);
+  g_nwarn++;
+  if (g_fatal_warnings) g_had_error = 1;
+}
+static void lerror(const char *fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  WALL_LOGE("linker", "%s\n", buf);
+  g_had_error = 1;
+}
+static int allow_undef_name(const char *name) {
+  for (int i = 0; i < g_nallow_undef; i++) if (!strcmp(g_allow_undef[i], name)) return 1;
+  return 0;
+}
+static int retain_has(const char *name) {
+  if (g_nretain == 0) return 1;
+  for (int i = 0; i < g_nretain; i++) if (!strcmp(g_retain[i], name)) return 1;
+  return 0;
+}
+
 static void sym_add(const char *name, uint64_t addr, int bind) {
   if (!name || !name[0]) return;
   SymEnt *e = sym_find(name);
   if (e) {
     if (bind == 1) {
+      if (e->bind == 1 && e->defined && !e->is_common && !g_allow_multiple_definition) {
+        lerror("multiple definition of '%s'", name);
+        return;
+      }
       e->addr = addr; e->bind = 1; e->defined = 1; e->is_common = 0;
     } else if (e->bind != 1) {
       e->addr = addr; e->bind = 2; e->defined = 1;
@@ -557,7 +634,7 @@ static void sym_add(const char *name, uint64_t addr, int bind) {
   if (g_nsym == g_capsym) {
     g_capsym = g_capsym ? g_capsym * 2 : 64;
     g_syms = (SymEnt *)realloc(g_syms, (size_t)g_capsym * sizeof(SymEnt));
-    if (!g_syms) { fprintf(stderr, "linker: error: out of memory\n"); exit(1); }
+    if (!g_syms) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
   }
   SymEnt *n = &g_syms[g_nsym++];
   memset(n, 0, sizeof(*n));
@@ -573,7 +650,7 @@ static SymEnt *sym_ensure(const char *name, int bind) {
   if (g_nsym == g_capsym) {
     g_capsym = g_capsym ? g_capsym * 2 : 64;
     g_syms = (SymEnt *)realloc(g_syms, (size_t)g_capsym * sizeof(SymEnt));
-    if (!g_syms) { fprintf(stderr, "linker: error: out of memory\n"); exit(1); }
+    if (!g_syms) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
   }
   e = &g_syms[g_nsym++];
   memset(e, 0, sizeof(*e));
@@ -605,6 +682,7 @@ static int sym_addr(Obj *o, uint32_t idx, uint64_t *out, const char **name_out) 
   if (shndx == SHN_COMMON) {
     SymEnt *e = sym_find(name);
     if (!e) return -2;
+    if (!g_define_common) return -2;
     *out = e->addr;
     return 0;
   }
@@ -650,6 +728,35 @@ static int register_symbols(void) {
 
 /* Allocate tentative definitions (SHN_COMMON) in .bss, after any GOT shift. */
 static void allocate_commons(void) {
+  if (!g_define_common) return;
+  /* --sort-common: largest alignment first, matching GNU ld's default. */
+  int n = 0;
+  for (int i = 0; i < g_nsym; i++) if (g_syms[i].is_common) n++;
+  if (g_warn_common) {
+    for (int i = 0; i < g_nsym; i++)
+      if (g_syms[i].is_common) lwarn("common symbol '%s' is being allocated", g_syms[i].name);
+  }
+  if (n > 1 && g_sort_common) {
+    SymEnt **v = (SymEnt **)malloc((size_t)n * sizeof(SymEnt *));
+    int k = 0;
+    for (int i = 0; i < g_nsym; i++) if (g_syms[i].is_common) v[k++] = &g_syms[i];
+    for (int i = 1; i < n; i++) {
+      SymEnt *x = v[i]; int j = i - 1;
+      while (j >= 0 && v[j]->common_align < x->common_align) { v[j + 1] = v[j]; j--; }
+      v[j + 1] = x;
+    }
+    for (int i = 0; i < n; i++) {
+      SymEnt *e = v[i];
+      uint64_t a = e->common_align ? e->common_align : 1;
+      g_bss = align_up(g_bss, a);
+      e->addr = g_bss_addr + g_bss;
+      g_bss += e->common_size;
+      e->is_common = 0;
+      e->defined = 1;
+    }
+    free(v);
+    return;
+  }
   for (int i = 0; i < g_nsym; i++) {
     SymEnt *e = &g_syms[i];
     if (!e->is_common) continue;
@@ -706,11 +813,11 @@ static int got_scan(void) {
         const char *name = "";
         int rc = sym_addr(o, symidx, &S, &name);
         if (rc != 0) {
-          fprintf(stderr, "linker: error: unresolved GOT symbol '%s' in '%s'\n", name, o->name);
+          WALL_LOGE("linker", "unresolved GOT symbol '%s' in '%s'\n", name, o->name);
           return -1;
         }
         if (got_for(name) != 0) {
-          fprintf(stderr, "linker: error: cannot allocate GOT entry for '%s'\n", name);
+          WALL_LOGE("linker", "cannot allocate GOT entry for '%s'\n", name);
           return -1;
         }
       }
@@ -864,7 +971,7 @@ static int apply_reloc(int kind, Obj *o, int target, uint64_t r_off, uint32_t ty
     case 311: { /* ADR_GOT_PAGE: page of the symbol's GOT entry */
       if (off + 4 > b->len) return -1;
       SymEnt *e = sym_find(name ? name : "");
-      if (!e || !e->has_got) { fprintf(stderr, "linker: error: missing GOT entry for '%s'\n", name ? name : "?"); return -1; }
+      if (!e || !e->has_got) { WALL_LOGE("linker", "missing GOT entry for '%s'\n", name ? name : "?"); return -1; }
       uint64_t G = e->got_addr;
       uint32_t insn = r32(b->p + off);
       int64_t delta = (int64_t)((G & ~0xFFFULL) - (P & ~0xFFFULL));
@@ -877,14 +984,14 @@ static int apply_reloc(int kind, Obj *o, int target, uint64_t r_off, uint32_t ty
     case 312: { /* LD64_GOT_LO12_NC: low 12 bits of the GOT entry */
       if (off + 4 > b->len) return -1;
       SymEnt *e = sym_find(name ? name : "");
-      if (!e || !e->has_got) { fprintf(stderr, "linker: error: missing GOT entry for '%s'\n", name ? name : "?"); return -1; }
+      if (!e || !e->has_got) { WALL_LOGE("linker", "missing GOT entry for '%s'\n", name ? name : "?"); return -1; }
       uint32_t insn = r32(b->p + off);
       uint32_t imm = (uint32_t)((e->got_addr & 0xFFF) >> 3);
       insn = (insn & ~(0xFFFu << 10)) | (imm << 10);
       w32(b->p + off, insn); return 0;
     }
     default:
-      fprintf(stderr, "linker: error: unsupported relocation type %u for '%s'\n", type, name ? name : "?");
+      WALL_LOGE("linker", "unsupported relocation type %u for '%s'\n", type, name ? name : "?");
       return -1;
   }
 }
@@ -912,11 +1019,19 @@ static int do_relocations(void) {
         const char *name = "";
         int rc = sym_addr(o, symidx, &S, &name);
         if (rc != 0) {
-          fprintf(stderr, "linker: error: unresolved symbol '%s' in '%s'\n", name, o->name);
-          return -1;
+          if (allow_undef_name(name)) {
+            S = 0;
+            if (g_warn_unresolved) lwarn("unresolved symbol '%s' in '%s' (explicitly allowed)", name, o->name);
+          } else if (g_warn_unresolved) {
+            S = 0;
+            lwarn("unresolved symbol '%s' in '%s'", name, o->name);
+          } else {
+            lerror("unresolved symbol '%s' in '%s'", name, o->name);
+            return -1;
+          }
         }
         if (apply_reloc(o->sec_kind[target], o, target, r_off, type, S, add, name) != 0) {
-          fprintf(stderr, "linker: error: relocation failed for '%s' in '%s'\n", name, o->name);
+          WALL_LOGE("linker", "relocation failed for '%s' in '%s'\n", name, o->name);
           return -1;
         }
       }
@@ -1261,7 +1376,7 @@ static int write_output(const char *path, const char *comment, uint64_t entry, i
   int n_shstr = b_stradd(&shstr, ".shstrtab");
 
   /* Symbols are optional output: a small, runnable binary needs none. */
-  int keep_syms = (!g_strip && g_nsym > 0);
+  int keep_syms = ((!g_strip || g_nretain > 0) && g_nsym > 0);
   Buf str; memset(&str, 0, sizeof(str));
   b_byte(&str, 0);
   Buf symtab; memset(&symtab, 0, sizeof(symtab));
@@ -1269,6 +1384,7 @@ static int write_output(const char *path, const char *comment, uint64_t entry, i
     static const unsigned char zero_sym[24] = {0};
     b_append(&symtab, zero_sym, sizeof(zero_sym));
     for (int i = 0; i < g_nsym; i++) {
+      if (!retain_has(g_syms[i].name)) continue;
       int no = b_stradd(&str, g_syms[i].name);
       unsigned char e[24];
       memset(e, 0, sizeof(e));
@@ -1305,7 +1421,7 @@ static int write_output(const char *path, const char *comment, uint64_t entry, i
   int phnum = (rw ? 3 : 2) + (g_build_id ? 1 : 0);
   uint64_t total = shoff + (uint64_t)shnum * 64;
   unsigned char *img = (unsigned char *)calloc(1, (size_t)total);
-  if (!img) { fprintf(stderr, "linker: error: out of memory\n"); return -1; }
+  if (!img) { WALL_LOGE("linker", "out of memory\n"); return -1; }
 
   /* ELF header */
   img[0] = 0x7f; img[1] = 'E'; img[2] = 'L'; img[3] = 'F';
@@ -1346,7 +1462,7 @@ static int write_output(const char *path, const char *comment, uint64_t entry, i
     w64(ph2 + 48, 0x1000);
     ph2 += 56;
   }
-  w32(ph2 + 0, 0x6474e551); w32(ph2 + 4, 6); /* PT_GNU_STACK */
+  w32(ph2 + 0, 0x6474e551); w32(ph2 + 4, g_execstack ? 7u : 6u); /* PT_GNU_STACK */
   w64(ph2 + 48, 16);
   if (g_build_id) {
     unsigned char *pn = ph2 + 56;
@@ -1432,16 +1548,16 @@ static int write_output(const char *path, const char *comment, uint64_t entry, i
   }
 
   FILE *f = fopen(path, "wb");
-  if (!f) { free(img); fprintf(stderr, "linker: error: cannot write '%s'\n", path); return -1; }
+  if (!f) { free(img); WALL_LOGE("linker", "cannot write '%s'\n", path); return -1; }
   size_t wr = fwrite(img, 1, (size_t)total, f);
   fclose(f);
   free(img);
   free(shstr.p); free(str.p); free(symtab.p);
-  if (wr != (size_t)total) { fprintf(stderr, "linker: error: short write to '%s'\n", path); return -1; }
+  if (wr != (size_t)total) { WALL_LOGE("linker", "short write to '%s'\n", path); return -1; }
   if (!shared) chmod(path, 0755);
-  if (g_map_path && g_map_path[0]) {
-    FILE *mf = fopen(g_map_path, "w");
-    if (!mf) { fprintf(stderr, "linker: warning: cannot write map '%s'\n", g_map_path); }
+  if ((g_map_path && g_map_path[0]) || g_map_stdout) {
+    FILE *mf = g_map_stdout ? stdout : fopen(g_map_path, "w");
+    if (!mf) { lwarn("cannot write map '%s'", g_map_path); }
     else {
       fprintf(mf, "wall linker map for %s\n", path);
       fprintf(mf, "text   0x%llx .. 0x%llx\n",
@@ -1462,13 +1578,22 @@ static int write_output(const char *path, const char *comment, uint64_t entry, i
       fprintf(mf, "\nsymbols:\n");
       for (int i = 0; i < g_nsym; i++)
         fprintf(mf, "  0x%016llx  %s\n", (unsigned long long)g_syms[i].addr, g_syms[i].name);
-      fclose(mf);
+      if (!g_map_stdout) fclose(mf);
     }
+  }
+  if (g_print_memory_usage) {
+    fprintf(stdout, "Memory region         Used Size  Region Size  %%age Used\n");
+    fprintf(stdout, "text                  %8zu B       n/a\n", g_text.len);
+    fprintf(stdout, "rodata                %8zu B       n/a\n", g_ro.len);
+    fprintf(stdout, "data                  %8zu B       n/a\n", g_data.len);
+    fprintf(stdout, "bss                   %8llu B       n/a\n", (unsigned long long)g_bss);
+    fprintf(stdout, "total                 %8llu B\n",
+            (unsigned long long)(g_text.len + g_ro.len + g_data.len + g_got.len + g_bss));
   }
   return 0;
 }
 /* ------------------------------------------------------------------------- */
-/* ELF relocation reference table (generated by tools/gen_linker_tables.sh).  */
+/* ELF relocation reference table (generated by scripts/gen_linker_tables.sh).  */
 /* Used by the --list-relocs diagnostic; the linker itself implements the     */
 /* AArch64 subset.                                                           */
 /* ------------------------------------------------------------------------- */
@@ -3073,7 +3198,7 @@ static void wall_list_relocs(int all) {
 /* Driver                                                                     */
 /* ------------------------------------------------------------------------- */
 /* ------------------------------------------------------------------------- */
-/* In-place ELF64 .comment editor (formerly tools/elfcomment.c)               */
+/* In-place ELF64 .comment editor (formerly src/common/elfcomment.h)               */
 /* ------------------------------------------------------------------------- */
 static int elf_comment_set(const char *path, const char *comment) {
   FILE *f = fopen(path, "rb+");
@@ -3207,9 +3332,139 @@ static int elf_comment_get(const char *path, char *out, size_t outlen) {
   return rc;
 }
 
+static int read_file_mem(const char *path, unsigned char **out, size_t *outsz) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  long sz = ftell(f);
+  if (sz < 0) { fclose(f); return -1; }
+  if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
+  unsigned char *b = (unsigned char *)malloc((size_t)sz);
+  if (!b && sz > 0) { fclose(f); return -1; }
+  if (sz > 0 && fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return -1; }
+  fclose(f);
+  *out = b;
+  *outsz = (size_t)sz;
+  return 0;
+}
+
+static void add_libdir(const char *dir) {
+  char **n = (char **)realloc(g_libdirs, (size_t)(g_nlibdirs + 1) * sizeof(char *));
+  if (!n) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
+  g_libdirs = n;
+  g_libdirs[g_nlibdirs++] = strdup(dir);
+}
+
+static int load_archive_path(const char *path) {
+  unsigned char *buf = NULL;
+  size_t sz = 0;
+  if (read_file_mem(path, &buf, &sz) != 0) return -1;
+  if (!is_ar(buf, sz)) {
+    free(buf);
+    WALL_LOGE("linker", "'%s' is not a static archive (Wall does not link shared libraries)\n", path);
+    return -1;
+  }
+  if (add_archive(path, buf, sz) != 0) { free(buf); return -1; }
+  return 0;
+}
+
+static int load_library(const char *name) {
+  char cand[4096];
+  if (strchr(name, '/')) return load_archive_path(name);
+  for (int pass = 0; pass < 2; pass++) {
+    const char *suffix = pass == 0 ? ".a" : ".so";
+    for (int i = 0; i < g_nlibdirs; i++) {
+      if (g_sysroot && g_sysroot[0])
+        snprintf(cand, sizeof(cand), "%s%s/lib%s%s", g_sysroot, g_libdirs[i], name, suffix);
+      else
+        snprintf(cand, sizeof(cand), "%s/lib%s%s", g_libdirs[i], name, suffix);
+      if (access(cand, R_OK) == 0) {
+        if (pass == 1) {
+          WALL_LOGE("linker", "'%s' is a shared library; the Wall linker produces fully static binaries\n", cand);
+          return -1;
+        }
+        return load_archive_path(cand);
+      }
+    }
+  }
+  WALL_LOGE("linker", "cannot find -l%s (searched %d librar%s directories)\n",
+            name, g_nlibdirs, g_nlibdirs == 1 ? "y" : "ies");
+  return -1;
+}
+
+static void add_required(const char *sym) {
+  char **n = (char **)realloc(g_required, (size_t)(g_nrequired + 1) * sizeof(char *));
+  if (!n) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
+  g_required = n;
+  g_required[g_nrequired++] = strdup(sym);
+}
+
+static void add_allow_undef(const char *sym) {
+  char **n = (char **)realloc(g_allow_undef, (size_t)(g_nallow_undef + 1) * sizeof(char *));
+  if (!n) { WALL_LOGE("linker", "out of memory\n"); exit(1); }
+  g_allow_undef = n;
+  g_allow_undef[g_nallow_undef++] = strdup(sym);
+}
+
+static int read_retain_file(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) { WALL_LOGE("linker", "cannot open retain file '%s'\n", path); return -1; }
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    char *e = p + strlen(p);
+    while (e > p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+    if (!*p) continue;
+    char **n = (char **)realloc(g_retain, (size_t)(g_nretain + 1) * sizeof(char *));
+    if (!n) { fclose(f); WALL_LOGE("linker", "out of memory\n"); return -1; }
+    g_retain = n;
+    g_retain[g_nretain++] = strdup(p);
+  }
+  fclose(f);
+  g_strip = 0;   /* retaining an explicit list implies a symbol table */
+  return 0;
+}
+
+static int parse_z_keyword(const char *kw) {
+  if (!strcmp(kw, "defs") || !strcmp(kw, "no-undefined")) { g_no_undefined = 1; return 0; }
+  if (!strcmp(kw, "muldefs")) { g_allow_multiple_definition = 1; return 0; }
+  if (!strcmp(kw, "noexecstack")) { g_execstack = 0; return 0; }
+  if (!strcmp(kw, "execstack")) { g_execstack = 1; return 0; }
+  if (!strcmp(kw, "now") || !strcmp(kw, "lazy") || !strcmp(kw, "relro") ||
+      !strcmp(kw, "norelro") || !strcmp(kw, "combreloc") || !strcmp(kw, "nocombreloc") ||
+      !strcmp(kw, "text") || !strcmp(kw, "notext") || !strcmp(kw, "nodefaultlib") ||
+      !strcmp(kw, "nodelete") || !strcmp(kw, "nocopyreloc") ||
+      !strcmp(kw, "separate-code") || !strcmp(kw, "noseparate-code") ||
+      !strcmp(kw, "ibt") || !strcmp(kw, "shstk") || !strcmp(kw, "cet-report") ||
+      !strcmp(kw, "pack-relative-relocs") || !strcmp(kw, "nopack-relative-relocs")) {
+    WALL_LOGW("linker", "'-z %s' has no effect on a fully static Wall executable\n", kw);
+    return 0;
+  }
+  WALL_LOGE("linker", "unsupported -z keyword '%s'\n", kw);
+  return -1;
+}
+
+static void print_link_stats(void) {
+  unsigned long long insns = 0, relocs = 0;
+  size_t text = g_text.len, ro = g_ro.len, data = g_data.len, got = g_got.len;
+  for (int k = 0; k < g_nobjs; k++) {
+    Obj *o = &g_objs[k];
+    for (int i = 1; i < o->shnum; i++) {
+      const unsigned char *sh = sh_ptr(o, i);
+      if (r32(sh + 4) == SHT_RELA) relocs += r64(sh + 32) / 24;
+    }
+  }
+  insns = (unsigned long long)(text / 4);
+  fprintf(stderr, "linker: stats: %d object(s), %d symbol(s), %llu relocation(s)\n",
+          g_nobjs, g_nsym, relocs);
+  fprintf(stderr, "linker: stats: text=%zu rodata=%zu data=%zu got=%zu bss=%llu (~%llu insns)\n",
+          text, ro, data, got, (unsigned long long)g_bss, insns);
+}
+
 static void usage(FILE *f) {
   fprintf(f,
-    "wallc version 1.0.0\n"
+    "wall version 1.0.0 - linker\n"
     "Usage: linker <input.o...> [-o <output>] [options]\n"
     "\n"
     "Self-contained static linker for AArch64 ELF objects.  It uses no\n"
@@ -3238,7 +3493,7 @@ static void usage(FILE *f) {
     "  -V, --version        Print version information\n");
 }
 
-int main(int argc, char **argv) {
+int linker_main(int argc, char **argv) {
   const char *out = "a.out";
   const char *entry_name = "_start";
   const char *comment = NULL;
@@ -3258,59 +3513,279 @@ int main(int argc, char **argv) {
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
+
     if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
-    else if (!strcmp(a, "-V") || !strcmp(a, "--version")) { printf("wallc version 1.0.0\n"); return 0; }
-    else if (!strcmp(a, "--list-relocs")) { wall_list_relocs(0); return 0; }
-    else if (!strcmp(a, "--list-relocs=all")) { wall_list_relocs(1); return 0; }
-    else if (!strcmp(a, "-o")) { if (i + 1 < argc) out = argv[++i]; else { fprintf(stderr, "linker: error: -o needs a file\n"); return 1; } }
-    else if (!strcmp(a, "-e") || !strcmp(a, "--entry")) { if (i + 1 < argc) entry_name = argv[++i]; else { fprintf(stderr, "linker: error: -e needs a symbol\n"); return 1; } }
-    else if (!strcmp(a, "--shared") || !strcmp(a, "-shared") || !strcmp(a, "-Bshareable")) { g_shared = 1; }
-    else if (!strcmp(a, "-r") || !strcmp(a, "--relocatable")) { relocatable = 1; }
-    else if (!strcmp(a, "--no-runtime")) { no_runtime = 1; }
-    else if (!strcmp(a, "--strip") || !strcmp(a, "-s")) { g_strip = 1; }
-    else if (!strcmp(a, "--symbols") || !strcmp(a, "--debug")) { g_strip = 0; }
-    else if (!strcmp(a, "--whole-archive")) { g_whole_archive = 1; }
-    else if (!strcmp(a, "--no-whole-archive")) { g_whole_archive = 0; }
-    else if (!strcmp(a, "-u")) { if (i + 1 < argc) forced[nforced++] = argv[++i]; else { fprintf(stderr, "linker: error: -u needs a symbol\n"); return 1; } }
-    else if (!strncmp(a, "-u", 2) && a[2]) { forced[nforced++] = a + 2; }
-    else if (!strncmp(a, "--undefined=", 12)) { forced[nforced++] = a + 12; }
-    else if (!strncmp(a, "--defsym=", 9)) {
+    if (!strcmp(a, "--help=all")) { wall_print_options(stdout, "ld"); return 0; }
+    if (!strcmp(a, "-V") || !strcmp(a, "--version")) { printf("wall version 1.0.0\n"); return 0; }
+    if (!strcmp(a, "--list-relocs")) { wall_list_relocs(0); return 0; }
+    if (!strcmp(a, "--list-relocs=all")) { wall_list_relocs(1); return 0; }
+
+    if (!strcmp(a, "-o") || !strcmp(a, "--output")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a file\n", a); return 1; }
+      out = argv[++i]; continue;
+    }
+    if (!strncmp(a, "-o", 2) && a[2]) { out = a + 2; continue; }
+    if (!strcmp(a, "-e") || !strcmp(a, "--entry")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a symbol\n", a); return 1; }
+      entry_name = argv[++i]; continue;
+    }
+    if (!strncmp(a, "--entry=", 8)) { entry_name = a + 8; continue; }
+    if (!strcmp(a, "--shared") || !strcmp(a, "-shared") || !strcmp(a, "-Bshareable")) { g_shared = 1; continue; }
+    if (!strcmp(a, "-pie") || !strcmp(a, "--pie")) { g_shared = 1; continue; }
+    if (!strcmp(a, "-r") || !strcmp(a, "--relocatable")) { relocatable = 1; continue; }
+    if (!strcmp(a, "--no-runtime")) { no_runtime = 1; continue; }
+    if (!strcmp(a, "--strip") || !strcmp(a, "-s") || !strcmp(a, "--strip-all")) { g_strip = 1; continue; }
+    if (!strcmp(a, "--symbols") || !strcmp(a, "--debug")) { g_strip = 0; continue; }
+    if (!strcmp(a, "--strip-debug") || !strcmp(a, "-S") || !strcmp(a, "--strip-discarded") ||
+        !strcmp(a, "--no-strip-discarded")) { /* Wall emits no debug/discarded sections. */ continue; }
+    if (!strcmp(a, "--whole-archive")) { g_whole_archive = 1; continue; }
+    if (!strcmp(a, "--no-whole-archive")) { g_whole_archive = 0; continue; }
+    if (!strcmp(a, "-u") || !strcmp(a, "--undefined")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a symbol\n", a); return 1; }
+      forced[nforced++] = argv[++i]; continue;
+    }
+    if (!strncmp(a, "-u", 2) && a[2]) { forced[nforced++] = a + 2; continue; }
+    if (!strncmp(a, "--undefined=", 12)) { forced[nforced++] = a + 12; continue; }
+    if (!strncmp(a, "--defsym=", 9)) {
       const char *spec = a + 9;
       const char *eq = strchr(spec, '=');
-      if (!eq || eq == spec) { fprintf(stderr, "linker: error: bad --defsym '%s'\n", spec); return 1; }
+      if (!eq || eq == spec) { WALL_LOGE("linker", "bad --defsym '%s'\n", spec); return 1; }
       char *nm = (char *)malloc((size_t)(eq - spec) + 1);
       memcpy(nm, spec, (size_t)(eq - spec));
       nm[eq - spec] = 0;
       defsyms[ndefsyms] = nm;
       defvals[ndefsyms] = strtoull(eq + 1, NULL, 0);
-      ndefsyms++;
+      ndefsyms++; continue;
     }
-    else if (!strncmp(a, "--build-id", 10)) { g_build_id = 1; }
-    else if (!strcmp(a, "--no-build-id")) { g_build_id = 0; }
-    else if (!strncmp(a, "--map=", 6)) { g_map_path = a + 6; }
-    else if (!strncmp(a, "--runtime=", 10)) { extra_rt = a + 10; }
-    else if (!strncmp(a, "--comment=", 10)) { comment = a + 10; }
-    else if (!strncmp(a, "--stamp-comment=", 16)) { stamp_comment = a + 16; }
-    else if (!strcmp(a, "--stamp-comment")) { if (i + 1 < argc) stamp_comment = argv[++i]; else { fprintf(stderr, "linker: error: --stamp-comment needs text\n"); return 1; } }
-    else if (!strcmp(a, "--get-comment")) { get_comment = 1; }
-    else if (!strcmp(a, "-v") || !strcmp(a, "--verbose") || !strcmp(a, "--print-map")) { verbose = 1; }
-    else if (!strcmp(a, "-static") || !strcmp(a, "-nostdlib") || !strcmp(a, "-nodefaultlibs") || !strcmp(a, "-nostartfiles")) { /* static is the only mode */ }
-    else if (!strcmp(a, "-L") || !strcmp(a, "-l") || !strncmp(a, "-L", 2) || !strncmp(a, "-l", 2)) { fprintf(stderr, "linker: error: library linking is disabled (no library usage)\n"); return 1; }
-    else if (!strncmp(a, "--target=", 9)) { const char *t = a + 9; if (strncmp(t, "aarch64", 7) != 0) { fprintf(stderr, "linker: error: unsupported target '%s'\n", t); return 1; } }
-    else if (!strncmp(a, "-z", 2) || !strncmp(a, "-O", 2) || !strncmp(a, "--hash-style=", 13) ||
-             !strncmp(a, "--sort-section=", 15) || !strcmp(a, "--no-undefined") ||
-             !strcmp(a, "--fatal-warnings") || !strcmp(a, "--no-fatal-warnings") ||
-             !strcmp(a, "--gc-sections") || !strcmp(a, "--no-gc-sections") ||
-             !strcmp(a, "-q") || !strcmp(a, "--emit-relocs")) { /* accepted for ld compatibility */ }
-    else if (a[0] == '-' && a[1]) { fprintf(stderr, "linker: error: unknown option '%s'\n", a); return 1; }
-    else { inputs[ninputs++] = argv[i]; }
+    if (!strcmp(a, "--build-id")) { g_build_id = 1; continue; }
+    if (!strncmp(a, "--build-id=", 11)) {
+      const char *s = a + 11;
+      if (!*s || !strcmp(s, "sha1")) g_build_id = 1;
+      else if (!strcmp(s, "none")) g_build_id = 0;
+      else { WALL_LOGE("linker", "unsupported build-id style '%s' (only sha1)\n", s); return 1; }
+      continue;
+    }
+    if (!strcmp(a, "--no-build-id")) { g_build_id = 0; continue; }
+    if (!strcmp(a, "--map") || !strcmp(a, "-Map")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a file\n", a); return 1; }
+      g_map_path = argv[++i]; continue;
+    }
+    if (!strncmp(a, "--map=", 6)) { g_map_path = a + 6; continue; }
+    if (!strncmp(a, "-Map=", 5)) { g_map_path = a + 5; continue; }
+    if (!strcmp(a, "-M") || !strcmp(a, "--print-map")) { g_map_stdout = 1; continue; }
+    if (!strncmp(a, "--runtime=", 10)) { extra_rt = a + 10; continue; }
+    if (!strncmp(a, "--comment=", 10)) { comment = a + 10; continue; }
+    if (!strncmp(a, "--stamp-comment=", 16)) { stamp_comment = a + 16; continue; }
+    if (!strcmp(a, "--stamp-comment")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "--stamp-comment needs text\n"); return 1; }
+      stamp_comment = argv[++i]; continue;
+    }
+    if (!strcmp(a, "--get-comment")) { get_comment = 1; continue; }
+    if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) { verbose = 1; continue; }
+    if (!strcmp(a, "--trace") || !strcmp(a, "-t")) { g_trace = 1; continue; }
+    if (!strcmp(a, "--no-trace")) { g_trace = 0; continue; }
+    if (!strcmp(a, "--stats")) { g_stats = 1; continue; }
+    if (!strcmp(a, "--print-memory-usage")) { g_print_memory_usage = 1; continue; }
+    if (!strcmp(a, "--print-output-format")) { g_print_output_format = 1; continue; }
+    if (!strncmp(a, "-O", 2)) { continue; } /* accepted optimisation hint */
+
+    if (!strcmp(a, "-Map") || !strncmp(a, "-Map=", 5)) { /* handled above */ }
+    if (!strncmp(a, "-Map", 4) && a[4]) { g_map_path = a + 4; continue; }
+    if (!strncmp(a, "-z", 2) && a[2] == 0) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "-z needs a keyword\n"); return 1; }
+      if (parse_z_keyword(argv[++i]) != 0) return 1;
+      continue;
+    }
+    if (!strncmp(a, "-z", 2) && a[2]) { if (parse_z_keyword(a + 2) != 0) return 1; continue; }
+
+    if (!strcmp(a, "-static") || !strcmp(a, "-Bstatic") || !strcmp(a, "-nostdlib") ||
+        !strcmp(a, "-nodefaultlibs") || !strcmp(a, "-nostartfiles")) continue;
+    if (!strcmp(a, "-Bdynamic")) { WALL_LOGE("linker", "dynamic linking is not supported; Wall links static executables\n"); return 1; }
+
+    if (!strcmp(a, "-L") || !strcmp(a, "--library-path")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a directory\n", a); return 1; }
+      add_libdir(argv[++i]); continue;
+    }
+    if (!strncmp(a, "-L", 2) && a[2]) { add_libdir(a + 2); continue; }
+    if (!strncmp(a, "--library-path=", 16)) { add_libdir(a + 16); continue; }
+    if (!strcmp(a, "-Y")) { if (i + 1 >= argc) { WALL_LOGE("linker", "-Y needs a path\n"); return 1; } add_libdir(argv[++i]); continue; }
+    if (!strncmp(a, "-Y", 2) && a[2]) { add_libdir(a + 2); continue; }
+    if (!strcmp(a, "-l") || !strcmp(a, "--library")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a library name\n", a); return 1; }
+      if (load_library(argv[++i]) != 0) return 1;
+      continue;
+    }
+    if (!strncmp(a, "-l", 2) && a[2]) { if (load_library(a + 2) != 0) return 1; continue; }
+    if (!strncmp(a, "--library=", 10)) { if (load_library(a + 10) != 0) return 1; continue; }
+    if (!strcmp(a, "--sysroot")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "--sysroot needs a directory\n"); return 1; }
+      g_sysroot = argv[++i]; continue;
+    }
+    if (!strncmp(a, "--sysroot=", 10)) { g_sysroot = a + 10; continue; }
+
+    if (!strcmp(a, "--push-state")) {
+      if (g_nstate_stack >= 32) { WALL_LOGE("linker", "option state stack overflow\n"); return 1; }
+      g_state_stack[g_nstate_stack].whole = g_whole_archive;
+      g_state_stack[g_nstate_stack].execstack = g_execstack;
+      g_nstate_stack++; continue;
+    }
+    if (!strcmp(a, "--pop-state")) {
+      if (g_nstate_stack <= 0) { WALL_LOGE("linker", "--pop-state without --push-state\n"); return 1; }
+      g_nstate_stack--;
+      g_whole_archive = g_state_stack[g_nstate_stack].whole;
+      g_execstack = g_state_stack[g_nstate_stack].execstack;
+      continue;
+    }
+
+    if (!strcmp(a, "--allow-multiple-definition") || !strcmp(a, "-z")) {
+      if (!strcmp(a, "-z")) {
+        if (i + 1 >= argc) { WALL_LOGE("linker", "-z needs a keyword\n"); return 1; }
+        if (parse_z_keyword(argv[++i]) != 0) return 1;
+      } else g_allow_multiple_definition = 1;
+      continue;
+    }
+    if (!strcmp(a, "--no-undefined")) { g_no_undefined = 1; continue; }
+    if (!strcmp(a, "--define-common") || !strcmp(a, "-d")) { g_define_common = 1; continue; }
+    if (!strcmp(a, "--no-define-common")) { g_define_common = 0; continue; }
+    if (!strcmp(a, "--fatal-warnings")) { g_fatal_warnings = 1; continue; }
+    if (!strcmp(a, "--no-fatal-warnings")) { g_fatal_warnings = 0; continue; }
+    if (!strcmp(a, "--no-warnings")) { g_no_warnings = 1; continue; }
+    if (!strcmp(a, "--warn-unresolved-symbols")) { g_warn_unresolved = 1; continue; }
+    if (!strcmp(a, "--no-warn-unresolved-symbols")) { g_warn_unresolved = 0; continue; }
+    if (!strcmp(a, "--warn-common")) { g_warn_common = 1; continue; }
+    if (!strcmp(a, "--no-warn-common")) { g_warn_common = 0; continue; }
+    if (!strcmp(a, "--sort-common")) { g_sort_common = 1; continue; }
+    if (!strcmp(a, "--no-sort-common")) { g_sort_common = 0; continue; }
+    if (!strcmp(a, "--require-defined")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "--require-defined needs a symbol\n"); return 1; }
+      add_required(argv[++i]); continue;
+    }
+    if (!strncmp(a, "--require-defined=", 18)) { add_required(a + 18); continue; }
+    if (!strcmp(a, "--retain-symbols-file")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "--retain-symbols-file needs a file\n"); return 1; }
+      g_retain_file = argv[++i];
+      if (read_retain_file(g_retain_file) != 0) return 1;
+      continue;
+    }
+    if (!strncmp(a, "--retain-symbols-file=", 22)) {
+      g_retain_file = a + 22;
+      if (read_retain_file(g_retain_file) != 0) return 1;
+      continue;
+    }
+    if (!strcmp(a, "-U") || !strcmp(a, "--allow-undefined")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a symbol\n", a); return 1; }
+      add_allow_undef(argv[++i]); continue;
+    }
+    if (!strncmp(a, "-U", 2) && a[2]) { add_allow_undef(a + 2); continue; }
+    if (!strcmp(a, "--error-execstack")) { g_error_execstack = 1; continue; }
+    if (!strcmp(a, "--no-error-execstack")) { g_error_execstack = 0; continue; }
+    if (!strcmp(a, "--warn-execstack") || !strcmp(a, "--warn-execstack-objects")) { g_warn_execstack = 1; continue; }
+    if (!strcmp(a, "--no-warn-execstack")) { g_warn_execstack = 0; continue; }
+    if (!strcmp(a, "--execstack")) { g_execstack = 1; continue; }
+    if (!strcmp(a, "--noexecstack")) { g_execstack = 0; continue; }
+    if (!strcmp(a, "--check-sections") || !strcmp(a, "--no-check-sections") ||
+        !strcmp(a, "--error-rwx-segments") || !strcmp(a, "--no-error-rwx-segments") ||
+        !strcmp(a, "--warn-rwx-segments") || !strcmp(a, "--no-warn-rwx-segments") ||
+        !strcmp(a, "--rosegment") || !strcmp(a, "--keep-memory") || !strcmp(a, "--no-keep-memory") ||
+        !strcmp(a, "--reduce-memory-overheads") || !strcmp(a, "--threads") ||
+        !strcmp(a, "--no-threads") || !strcmp(a, "--no-relax") || !strcmp(a, "--no-gc-sections") ||
+        !strcmp(a, "--no-emit-relocs") || !strcmp(a, "--no-gnu-unique") ||
+        !strcmp(a, "--no-omagic") || !strcmp(a, "--no-warn-shared-textrel") ||
+        !strcmp(a, "--no-warn-constructors") || !strcmp(a, "--no-warn-multiple-gp")) continue;
+    if (!strcmp(a, "--no-export-dynamic")) continue;
+
+    if (!strcmp(a, "--oformat")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "--oformat needs a format\n"); return 1; }
+      g_oformat = argv[++i];
+      if (strcmp(g_oformat, "elf64-aarch64") && strcmp(g_oformat, "elf64-littleaarch64") && strcmp(g_oformat, "default"))
+        { WALL_LOGE("linker", "unsupported output format '%s'\n", g_oformat); return 1; }
+      continue;
+    }
+    if (!strncmp(a, "--oformat=", 10)) {
+      g_oformat = a + 10;
+      if (strcmp(g_oformat, "elf64-aarch64") && strcmp(g_oformat, "elf64-littleaarch64") && strcmp(g_oformat, "default"))
+        { WALL_LOGE("linker", "unsupported output format '%s'\n", g_oformat); return 1; }
+      continue;
+    }
+    if (!strcmp(a, "-b") || !strcmp(a, "--format")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs a format\n", a); return 1; }
+      const char *f = argv[++i];
+      if (strcmp(f, "elf64") && strcmp(f, "elf64-littleaarch64") && strcmp(f, "default"))
+        { WALL_LOGE("linker", "unsupported input format '%s'\n", f); return 1; }
+      continue;
+    }
+    if (!strcmp(a, "-A") || !strcmp(a, "--architecture")) {
+      if (i + 1 >= argc) { WALL_LOGE("linker", "%s needs an architecture\n", a); return 1; }
+      const char *arch = argv[++i];
+      if (strcmp(arch, "aarch64") && strcmp(arch, "aarch64linux") && strcmp(arch, "arm64"))
+        { WALL_LOGE("linker", "unsupported architecture '%s'\n", arch); return 1; }
+      continue;
+    }
+    if (!strncmp(a, "--target=", 9)) {
+      const char *t = a + 9;
+      if (strncmp(t, "aarch64", 7) != 0 && strncmp(t, "arm64", 5) != 0)
+        { WALL_LOGE("linker", "unsupported target '%s'\n", t); return 1; }
+      continue;
+    }
+
+    if (!strcmp(a, "-T") || !strcmp(a, "--script") || !strcmp(a, "--mri-script") ||
+        !strcmp(a, "--plugin") || !strcmp(a, "--plugin-opt") || !strcmp(a, "--just-symbols") ||
+        !strcmp(a, "-R") || !strcmp(a, "--wrap") || !strcmp(a, "--exclude-libs") ||
+        !strcmp(a, "-F") || !strcmp(a, "--filter") || !strcmp(a, "--no-filter") ||
+        !strcmp(a, "-f") || !strcmp(a, "--auxiliary") || !strcmp(a, "--audit") ||
+        !strcmp(a, "--dynamic-linker") || !strcmp(a, "--soname") || !strcmp(a, "--rpath") ||
+        !strcmp(a, "--rpath-link") || !strcmp(a, "--enable-new-dtags") ||
+        !strcmp(a, "--disable-new-dtags") || !strcmp(a, "-E") || !strcmp(a, "--export-dynamic") ||
+        !strcmp(a, "--dynamic-list") || !strcmp(a, "--dynamic-list-cpp-new") ||
+        !strcmp(a, "--dynamic-list-cpp-typeinfo") || !strcmp(a, "--version-script") ||
+        !strcmp(a, "--allow-shlib-undefined") || !strcmp(a, "--no-allow-shlib-undefined") ||
+        !strcmp(a, "--hash-style") || !strcmp(a, "--hash-size") || !strcmp(a, "--spare-dynamic-tags") ||
+        !strcmp(a, "--unique") || !strcmp(a, "--gnu-unique") || !strcmp(a, "--default-imported-symver") ||
+        !strcmp(a, "--no-default-imported-symver") || !strcmp(a, "--no-undefined-version") ||
+        !strcmp(a, "--undefined-version") || !strcmp(a, "--orphan-handling") ||
+        !strcmp(a, "--package-metadata") || !strcmp(a, "--compress-debug-sections") ||
+        !strcmp(a, "--no-compress-debug-sections") || !strcmp(a, "--cref") || !strcmp(a, "--no-cref") ||
+        !strcmp(a, "--demangle") || !strcmp(a, "--no-demangle") || !strcmp(a, "--gc-sections") ||
+        !strcmp(a, "--gc-keep-exported") || !strcmp(a, "--emit-relocs") || !strcmp(a, "-q") ||
+        !strcmp(a, "--sort-section") || !strcmp(a, "--section-start") || !strcmp(a, "-Ttext") ||
+        !strcmp(a, "-Tdata") || !strcmp(a, "-Tbss") || !strcmp(a, "-Ttext-segment") ||
+        !strcmp(a, "--section-alignment") || !strcmp(a, "--max-page-size") ||
+        !strcmp(a, "--common-page-size") || !strcmp(a, "--noinhibit-exec") ||
+        !strcmp(a, "--omagic") || !strcmp(a, "-N") || !strcmp(a, "--nmagic") || !strcmp(a, "-n") ||
+        !strcmp(a, "-i") || !strcmp(a, "--relax") || !strcmp(a, "--no-rosegment") ||
+        !strcmp(a, "-C") || !strcmp(a, "--no-warn-section-align") || !strcmp(a, "--warn-section-align") ||
+        !strcmp(a, "--warn-constructors") || !strcmp(a, "--warn-multiple-gp") ||
+        !strcmp(a, "--warn-shared-textrel")) {
+      WALL_LOGE("linker", "option '%s' is not implemented by the Wall linker\n", a);
+      return 1;
+    }
+
+    if (a[0] == '-' && a[1] && strcmp(a, "-")) {
+      int sup = 0;
+      if (wall_option_known("ld", a, &sup))
+        WALL_LOGE("linker", "option '%s' is listed in the catalogue but is not implemented\n", a);
+      else
+        WALL_LOGE("linker", "unknown option '%s'\n", a);
+      return 1;
+    }
+    inputs[ninputs++] = argv[i];
   }
+  (void)g_no_undefined;
+  (void)g_trace;
+  (void)g_stats;
+  (void)g_print_output_format;
+  (void)g_require_defined;
+  (void)g_retain_file;
+  (void)g_maplines;
+  (void)g_nmaplines;
+
+  if (g_print_output_format) { printf("elf64-aarch64\n"); return 0; }
 
   if (get_comment) {
-    if (ninputs != 1) { fprintf(stderr, "linker: error: --get-comment needs one file\n"); return 1; }
+    if (ninputs != 1) { WALL_LOGE("linker", "--get-comment needs one file\n"); return 1; }
     char buf[1024];
     if (elf_comment_get(inputs[0], buf, sizeof(buf)) != 0) {
-      fprintf(stderr, "linker: error: no .comment in '%s'\n", inputs[0]);
+      WALL_LOGE("linker", "no .comment in '%s'\n", inputs[0]);
       return 1;
     }
     printf("%s\n", buf);
@@ -3318,53 +3793,63 @@ int main(int argc, char **argv) {
   }
 
   if (stamp_comment) {
-    if (ninputs == 0) { fprintf(stderr, "linker: error: --stamp-comment needs at least one file\n"); return 1; }
+    if (ninputs == 0) { WALL_LOGE("linker", "--stamp-comment needs at least one file\n"); return 1; }
     int rc = 0;
     for (int i = 0; i < ninputs; i++) {
       int r = elf_comment_set(inputs[i], stamp_comment);
-      if (r == -2) { fprintf(stderr, "linker: error: '%s' has no usable .comment section\n", inputs[i]); rc = 1; }
-      else if (r != 0) { fprintf(stderr, "linker: error: cannot edit '%s'\n", inputs[i]); rc = 1; }
+      if (r == -2) { WALL_LOGE("linker", "'%s' has no usable .comment section\n", inputs[i]); rc = 1; }
+      else if (r != 0) { WALL_LOGE("linker", "cannot edit '%s'\n", inputs[i]); rc = 1; }
     }
     return rc;
   }
 
-  if (ninputs == 0) { fprintf(stderr, "linker: error: no input files\n"); return 1; }
+  if (ninputs == 0) { WALL_LOGE("linker", "no input files\n"); return 1; }
 
   for (int i = 0; i < ninputs; i++) {
+    if (g_trace) fprintf(stderr, "linker: input %s\n", inputs[i]);
     FILE *f = fopen(inputs[i], "rb");
-    if (!f) { fprintf(stderr, "linker: error: cannot open '%s'\n", inputs[i]); return 1; }
+    if (!f) { WALL_LOGE("linker", "cannot open '%s'\n", inputs[i]); return 1; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     unsigned char *buf = (unsigned char *)malloc((size_t)sz);
-    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); fprintf(stderr, "linker: error: cannot read '%s'\n", inputs[i]); return 1; }
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); WALL_LOGE("linker", "cannot read '%s'\n", inputs[i]); return 1; }
     fclose(f);
     if (is_ar(buf, (size_t)sz)) {
-      if (add_archive(inputs[i], buf, (size_t)sz) != 0) { fprintf(stderr, "linker: error: invalid archive '%s'\n", inputs[i]); return 1; }
+      if (add_archive(inputs[i], buf, (size_t)sz) != 0) { WALL_LOGE("linker", "invalid archive '%s'\n", inputs[i]); return 1; }
     } else if (add_object(inputs[i], buf, (size_t)sz, 1) != 0) {
-      fprintf(stderr, "linker: error: invalid object '%s'\n", inputs[i]); return 1;
+      WALL_LOGE("linker", "invalid object '%s'\n", inputs[i]); return 1;
     }
   }
 
   if (extra_rt) {
     FILE *f = fopen(extra_rt, "rb");
-    if (!f) { fprintf(stderr, "linker: error: cannot open runtime '%s'\n", extra_rt); return 1; }
+    if (!f) { WALL_LOGE("linker", "cannot open runtime '%s'\n", extra_rt); return 1; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     unsigned char *buf = (unsigned char *)malloc((size_t)sz);
-    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); fprintf(stderr, "linker: error: cannot read runtime '%s'\n", extra_rt); return 1; }
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); WALL_LOGE("linker", "cannot read runtime '%s'\n", extra_rt); return 1; }
     fclose(f);
-    if (add_object(extra_rt, buf, (size_t)sz, 1) != 0) { fprintf(stderr, "linker: error: invalid runtime '%s'\n", extra_rt); return 1; }
+    if (add_object(extra_rt, buf, (size_t)sz, 1) != 0) { WALL_LOGE("linker", "invalid runtime '%s'\n", extra_rt); return 1; }
   }
 
   if (!no_runtime && !relocatable) {
-    if (add_object("<wallrt>", wallrt_obj_bytes, wallrt_obj_len, 0) != 0) { fprintf(stderr, "linker: error: embedded runtime is corrupt\n"); return 1; }
-    if (add_object("<start>", start_obj_bytes, start_obj_len, 0) != 0) { fprintf(stderr, "linker: error: embedded start object is corrupt\n"); return 1; }
+    if (add_object("<wallrt>", wallrt_obj_bytes, wallrt_obj_len, 0) != 0) { WALL_LOGE("linker", "embedded runtime is corrupt\n"); return 1; }
+    if (add_object("<start>", start_obj_bytes, start_obj_len, 0) != 0) { WALL_LOGE("linker", "embedded start object is corrupt\n"); return 1; }
+  }
+
+  for (int k = 0; k < g_nobjs; k++) {
+    if (!g_objs[k].execstack) continue;
+    if (g_error_execstack) {
+      lerror("'%s' requires an executable stack", g_objs[k].name);
+      return 1;
+    }
+    if (g_warn_execstack) lwarn("'%s' requires an executable stack", g_objs[k].name);
   }
 
   for (int i = 0; i < nforced; i++) undef_add(forced[i]);
-  if (resolve_archives() != 0) { fprintf(stderr, "linker: error: archive resolution failed\n"); return 1; }
+  if (resolve_archives() != 0) { WALL_LOGE("linker", "archive resolution failed\n"); return 1; }
 
   if (relocatable) {
     const char *cmt = (comment && comment[0]) ? comment : WALL_DEFAULT_COMMENT;
@@ -3379,12 +3864,18 @@ int main(int argc, char **argv) {
   if (got_scan() != 0) return 1;
   build_got();
   allocate_commons();
+  for (int i = 0; i < g_nrequired; i++) {
+    SymEnt *e = sym_find(g_required[i]);
+    if (!e || !e->defined) lerror("required symbol '%s' is not defined", g_required[i]);
+  }
+  if (g_had_error) return 1;
   if (do_relocations() != 0) return 1;
+  if (g_had_error) return 1;
 
   uint64_t entry = 0;
   SymEnt *es = sym_find(entry_name);
   if (es) entry = es->addr;
-  else if (!g_shared) fprintf(stderr, "linker: warning: entry symbol '%s' not found\n", entry_name);
+  else if (!g_shared) WALL_LOGW("linker", "entry symbol '%s' not found\n", entry_name);
 
   if (verbose) {
     fprintf(stderr, "linker: text=%zu rodata=%zu data=%zu bss=%llu\n",
@@ -3397,5 +3888,13 @@ int main(int argc, char **argv) {
 
   const char *cmt = (comment && comment[0]) ? comment : WALL_DEFAULT_COMMENT;
   if (write_output(out, cmt, entry, g_shared) != 0) return 1;
+  if (g_stats) print_link_stats();
   return 0;
 }
+
+/* Entry point used by the merged wall driver and by the linker symlink. */
+int wall_link(int argc, char **argv) { return linker_main(argc, argv); }
+
+#ifndef WALL_MULTICALL
+int main(int argc, char **argv) { return linker_main(argc, argv); }
+#endif

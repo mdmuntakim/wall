@@ -57,13 +57,13 @@ extern "C" {
  */
 
 /* The canonical compiler name. */
-#define WALL_COMPILER_NAME "wallc"
+#define WALL_COMPILER_NAME "wall"
 
 /* The compiler version, as integers and as a string. */
 #define WALL_VERSION_MAJOR 1
 #define WALL_VERSION_MINOR 0
 #define WALL_VERSION_PATCH 0
-#define WALL_VERSION_STRING "wallc version 1.0.0"
+#define WALL_VERSION_STRING "wall version 1.0.0"
 
 /* The source language revision understood by this ABI. */
 #define WALL_LANGUAGE_STD "wall21"
@@ -130,7 +130,7 @@ enum wall_status {
 const char *wall_version_string(void);
 
 /* wall_version:
- *   Copy a human readable version line ("wallc version 1.0.0") into `buf`.
+ *   Copy a human readable version line ("wall version 1.0.0") into `buf`.
  *   At most `buflen` bytes (including the trailing NUL) are written.  Returns
  *   0 on success, -1 when `buf` is NULL or `buflen` is too small.
  */
@@ -338,7 +338,7 @@ typedef struct wall_options {
  * them when they are absent.
  */
 typedef struct wall_backend_info {
-  const char *name;       /* "wallc" */
+  const char *name;       /* "wall" */
   const char *version;    /* "1.0.0" */
   int abi_revision;       /* WALL_ABI_REVISION */
   const char *target;     /* default triple */
@@ -445,7 +445,7 @@ typedef struct wall_backend_info {
  *
  * The backend emits textual LLVM IR with opaque pointers:
  *
- *   ; ModuleID = 'wallc'
+ *   ; ModuleID = 'wall'
  *   target datalayout = "e-m:e-i64:64-i128:128-n32:64-S128"
  *   target triple = "aarch64-unknown-linux-android"
  *
@@ -495,7 +495,7 @@ typedef struct wall_backend_info {
  *
  * To add a target:
  *
- *   1. Add the triple to build.sh's cross-target table.
+ *   1. Add the triple to scripts/build.sh cross-target table.
  *   2. Ensure the toolchain can link the compiler-rt builtins and libunwind
  *      for that triple (the driver and backend are freestanding enough to run
  *      without libc++).
@@ -504,10 +504,10 @@ typedef struct wall_backend_info {
  *
  * To add a language feature:
  *
- *   1. Extend the lexer keyword table in stage0/lib/libwall.c.
+ *   1. Extend the lexer keyword table in src/compiler/libwall.c.
  *   2. Add token kinds here and in the parser's precedence table.
  *   3. Add an AST node kind and a parser production.
  *   4. Emit IR from the code generator and add a test under tests/.
- *   5. Mirror the change in stage1/src/*.wa so the self-hosted compiler keeps
+ *   5. Mirror the change in the stage1 sources so the self-hosted compiler keeps
  *      up with the bootstrap.
  */

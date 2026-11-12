@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.c text
+*.h text
+*.md text
+*.sh text eol=lf
+*.wa text
+Makefile text
+*.o binary
+*.so binary
+*.deb binary
+*.xz binary

@@ -4,7 +4,7 @@
 
 fn wall_version(buf: string, buflen: int) -> int {
     if buf != null {
-        buf = "wallc version 1.0.0 (285fd1c)";
+        buf = "wall version 1.0.0 (285fd1c)";
     }
     return 0;
 }

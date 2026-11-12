@@ -6,17 +6,23 @@
  * The backend is pluggable: the `wall` driver dlopen()s a backend shared
  * library exposing `wall_version` and `wall_compile`.
  */
-#include "wall.h"
+#include "wall/wall.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include "wall_log.h"
 
-const char *wall_version_string(void) { return "Wall/1.0.0"; }
+#ifndef WALL_DEFAULT_COMMENT
+#define WALL_DEFAULT_COMMENT "wall version 1.0.0"
+#endif
+
+const char *wall_version_string(void) { return WALL_DEFAULT_COMMENT; }
+const char *wall_build_comment(void) { return WALL_DEFAULT_COMMENT; }
 
 int wall_version(char *buf, int buflen) {
-  snprintf(buf, (size_t)buflen, "wallc version 1.0.0");
+  snprintf(buf, (size_t)buflen, "%s", WALL_DEFAULT_COMMENT);
   return 0;
 }
 
@@ -132,6 +138,9 @@ static void lex(Lexer *L) {
     {
       char c1 = L->src[L->pos];
       char tb[3]; tb[0] = c1; tb[1] = L->src[L->pos + 1]; tb[2] = 0;
+      if (c1 == '.' && L->src[L->pos + 1] == '.' && L->src[L->pos + 2] == '.') {
+        t.type = TK_PUNCT; t.text = xstrdup("..."); tok_push(L, t); L->pos += 3; L->col += 3; continue;
+      }
       int is_two = !strcmp(tb, "->") || !strcmp(tb, "&&") || !strcmp(tb, "||") ||
                    !strcmp(tb, "==") || !strcmp(tb, "!=") || !strcmp(tb, "<=") ||
                    !strcmp(tb, ">=") || !strcmp(tb, ">>") || !strcmp(tb, "<<") ||
@@ -166,6 +175,12 @@ typedef struct { char *name; int ret; int nparams; int ptypes[8]; char pnames[8]
 static Func *g_fns; static int g_nfn, g_fncap;
 typedef struct { char name[32]; int ty; long long val; } Glob;
 static Glob g_globs[256]; static int g_nglobs;
+
+/* Declarations introduced by `extern`. */
+typedef struct { char name[64]; int ret; int nparams; int ptypes[8]; int vararg; } ExtFn;
+static ExtFn g_extfns[64]; static int g_nextfns;
+typedef struct { char name[64]; int ty; } ExtGlob;
+static ExtGlob g_extglobs[64]; static int g_nextglobs;
 
 /* ---------------- parser ---------------- */
 typedef struct { Lexer *L; int pos; char err[512]; int had_err; } Parser;
@@ -404,6 +419,64 @@ static Node *parse_block(Parser *p) {
 static void parse_program(Parser *p) {
   while (cur(p)->type != TK_EOF) {
     Token *t = cur(p);
+    if (t->type == TK_IDENT && t->text && strcmp(t->text, "extern") == 0) {
+      adv(p);
+      Token *k = cur(p);
+      if (k->type == TK_IDENT && k->text && strcmp(k->text, "fn") == 0) {
+        adv(p);
+        Token *n2 = cur(p);
+        if (n2->type != TK_IDENT) { perr(p, "%d:%d: error: expected an external function name", n2->line, n2->col); break; }
+        ExtFn ef; memset(&ef, 0, sizeof(ef));
+        snprintf(ef.name, sizeof(ef.name), "%s", n2->text); adv(p);
+        ef.ret = T_I32;
+        if (!accept_punct(p, "(")) { perr(p, "%d:%d: error: expected '(' after '%s'", cur(p)->line, cur(p)->col, ef.name); break; }
+        if (!is_punct(cur(p), ")")) {
+          for (;;) {
+            if (is_punct(cur(p), "...")) { ef.vararg = 1; adv(p); break; }
+            Token *pa = cur(p);
+            if (pa->type != TK_IDENT) { perr(p, "%d:%d: error: expected an external parameter name", pa->line, pa->col); break; }
+            char *pname = xstrdup(pa->text); adv(p);
+            if (!accept_punct(p, ":")) { perr(p, "%d:%d: error: expected ':' in parameter '%s'", cur(p)->line, cur(p)->col, pname); break; }
+            int pty = 0;
+            if (parse_type(p, &pty) != 0) break;
+            if (ef.nparams < 8) ef.ptypes[ef.nparams] = pty;
+            ef.nparams++;
+            free(pname);
+            if (accept_punct(p, ",")) continue;
+            break;
+          }
+        }
+        if (!accept_punct(p, ")")) { perr(p, "%d:%d: error: expected ')' after external parameters", cur(p)->line, cur(p)->col); break; }
+        if (accept_punct(p, "->")) { if (parse_type(p, &ef.ret) != 0) break; }
+        if (!accept_punct(p, ";")) { perr(p, "%d:%d: error: expected ';' after external function", cur(p)->line, cur(p)->col); break; }
+        if (g_nextfns < 64) g_extfns[g_nextfns++] = ef;
+        continue;
+      }
+      if (k->type == TK_IDENT && k->text && (strcmp(k->text, "global") == 0 || strcmp(k->text, "let") == 0)) {
+        adv(p);
+        Token *n2 = cur(p);
+        if (n2->type != TK_IDENT) { perr(p, "%d:%d: error: expected an external global name", n2->line, n2->col); break; }
+        ExtGlob eg; memset(&eg, 0, sizeof(eg));
+        snprintf(eg.name, sizeof(eg.name), "%s", n2->text); adv(p);
+        if (!accept_punct(p, ":")) { perr(p, "%d:%d: error: expected ':' in external global '%s'", cur(p)->line, cur(p)->col, eg.name); break; }
+        if (parse_type(p, &eg.ty) != 0) break;
+        if (!accept_punct(p, ";")) { perr(p, "%d:%d: error: expected ';' after external global", cur(p)->line, cur(p)->col); break; }
+        if (g_nextglobs < 64) g_extglobs[g_nextglobs++] = eg;
+        continue;
+      }
+      if (k->type == TK_IDENT && k->text && strcmp(k->text, "type") == 0) {
+        /* Opaque external type: accepted as a name only.  Wall has no
+         * user-defined aggregate types yet, so it cannot be instantiated. */
+        adv(p);
+        Token *n2 = cur(p);
+        if (n2->type != TK_IDENT) { perr(p, "%d:%d: error: expected an external type name", n2->line, n2->col); break; }
+        adv(p);
+        if (!accept_punct(p, ";")) { perr(p, "%d:%d: error: expected ';' after external type", cur(p)->line, cur(p)->col); break; }
+        continue;
+      }
+      perr(p, "%d:%d: error: expected 'fn', 'global', 'let' or 'type' after 'extern'", k->line, k->col);
+      break;
+    }
     if (t->type == TK_IDENT && t->text && strcmp(t->text, "global") == 0) {
       adv(p);
       Token *n2 = cur(p);
@@ -575,6 +648,7 @@ static Val gen_expr(Gen *g, Node *n) {
     }
     int retty = T_I32;
     for (int i = 0; i < g_nfn; i++) { if (g_fns && i < g_nfn && g_fns[i].name && strcmp(g_fns[i].name, n->name) == 0) { retty = g_fns[i].ret; break; } }
+    for (int i = 0; i < g_nextfns; i++) { if (strcmp(g_extfns[i].name, n->name) == 0) { retty = g_extfns[i].ret; break; } }
     char r1[32]; snprintf(r1, sizeof(r1), "%%t%d", g->tmpc); g->tmpc++;
     Buf c; buf_init(&c);
     buf_putf(&c, "  %s = call %s @%s(", r1, llvm_ty(retty), n->name);
@@ -769,14 +843,18 @@ static void wall_compile_module(Buf *out) {
   Buf fbs[64]; int nfbs = 0;
   for (int i = 0; i < g_nfn; i++) {
     Gen g; memset(&g, 0, sizeof(g));
-    for (int j = 0; j < g_nglobs && j < 64; j++) { snprintf(g.gnames[j], sizeof(g.gnames[j]), "%s", g_globs[j].name); g.gntys[j] = g_globs[j].ty; }
-    g.ngns = g_nglobs < 64 ? g_nglobs : 64;
+    int ng = 0;
+    for (int j = 0; j < g_nglobs && ng < 64; j++) { snprintf(g.gnames[ng], sizeof(g.gnames[ng]), "%s", g_globs[j].name); g.gntys[ng] = g_globs[j].ty; ng++; }
+    for (int j = 0; j < g_nextglobs && ng < 64; j++) { snprintf(g.gnames[ng], sizeof(g.gnames[ng]), "%s", g_extglobs[j].name); g.gntys[ng] = g_extglobs[j].ty; ng++; }
+    g.ngns = ng;
     Buf *fb = &fbs[nfbs++];
     memset(fb, 0, sizeof(Buf));
     gen_function(&g, &g_fns[i]);
     *fb = g.out;
   }
-  buf_puts(out, "; ModuleID = 'wallc'\n");
+  buf_puts(out, "; ModuleID = 'wall'\n");
+  buf_puts(out, "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n");
+  buf_puts(out, "target triple = \"aarch64-unknown-linux-android24\"\n");
   for (int i = 0; i < g_nstrs; i++) buf_puts(out, g_strs[i].line);
   for (int i = 0; i < g_nglobs; i++) {
     Buf gb; buf_init(&gb);
@@ -784,7 +862,24 @@ static void wall_compile_module(Buf *out) {
     else buf_putf(&gb, "@%s = global %s %lld\n", g_globs[i].name, llvm_ty(g_globs[i].ty), g_globs[i].val);
     buf_puts(out, gb.data);
   }
-  buf_putf(out, "declare i32 @printf(ptr, ...)\n");
+  for (int i = 0; i < g_nextglobs; i++) {
+    buf_putf(out, "@%s = external global %s\n", g_extglobs[i].name, llvm_ty(g_extglobs[i].ty));
+  }
+  int have_printf = 0;
+  for (int i = 0; i < g_nextfns; i++) {
+    if (!strcmp(g_extfns[i].name, "printf")) have_printf = 1;
+    int dup = 0;
+    for (int j = 0; j < i; j++) if (!strcmp(g_extfns[j].name, g_extfns[i].name)) dup = 1;
+    if (dup) continue;
+    buf_putf(out, "declare %s @%s(", llvm_ty(g_extfns[i].ret), g_extfns[i].name);
+    for (int j = 0; j < g_extfns[i].nparams && j < 8; j++) {
+      if (j) buf_puts(out, ", ");
+      buf_puts(out, llvm_ty(g_extfns[i].ptypes[j]));
+    }
+    if (g_extfns[i].vararg) buf_puts(out, ", ...");
+    buf_puts(out, ")\n");
+  }
+  if (!have_printf) buf_putf(out, "declare i32 @printf(ptr, ...)\n");
   for (int i = 0; i < nfbs; i++) buf_puts(out, fbs[i].data);
 }
 

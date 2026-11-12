@@ -1,0 +1,5 @@
+global answer: i32 = 42;
+
+fn provider_marker() -> i32 {
+  return 0;
+}

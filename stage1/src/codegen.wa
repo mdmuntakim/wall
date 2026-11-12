@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // Wall self-hosted code generator.
 //
-// Direct transformation of the C code generator in stage0/lib/libwall.c:
+// Direct transformation of the C code generator in src/compiler/libwall.c:
 //
 //     llvm_ty()             -> llvm_ty()
 //     gen_expr()            -> gen_expr()
@@ -585,7 +585,7 @@ fn wall_compile_module() -> string {
     out = out + "; func" + rt_itos(i) + "\n" + g_gen_out;
     i = i + 1;
   }
-  out = "; ModuleID = 'wallc'\n" + out;
+  out = "; ModuleID = 'wall'\n" + out;
   let ng: i32 = rt_glob_count();
   let j: i32 = 0;
   while (j < ng) {
