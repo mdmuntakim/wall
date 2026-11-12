@@ -17,7 +17,9 @@ OBASM=stage1/tools/obasm.wa
 # ---------------------------------------------------------------------------
 # 1. Real reference content for linker.wa (written once, marker guarded)
 # ---------------------------------------------------------------------------
-if ! grep -q "WALL_LINKER_REFERENCE_BEGIN" "$LINKER" 2>/dev/null; then
+if head -n 1 "$LINKER" 2>/dev/null | grep -q "Generated from"; then
+  echo "linker.wa is the exact ctowa translation; skipping table expansion"
+elif ! grep -q "WALL_LINKER_REFERENCE_BEGIN" "$LINKER" 2>/dev/null; then
 cat >> "$LINKER" <<'WALL_EOF'
 
 // ===========================================================================
@@ -328,23 +330,9 @@ WALL_EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Grow linker.wa to at least 200 KiB with ABI descriptor blocks
+# 2. No synthetic padding.  linker.wa is the exact ctowa translation of
+#    tools/linker.c, so its size comes from real translated source.
 # ---------------------------------------------------------------------------
-LINK_TARGET=205000
-n=0
-while [ "$(wc -c < "$LINKER")" -lt "$LINK_TARGET" ]; do
-  awk -v base="$n" -v count=400 'BEGIN {
-    printf("// ---- generated linker ABI block %06d ----\n", base);
-    for (i = 0; i < count; i++) {
-      id = base + i;
-      printf("global LINK_ABI_DESC_%06d: i32 = %d;\n", id, id % 251);
-      printf("fn link_abi_%06d_ptr_align() -> i32 { return %d; }\n", id, (id % 2) ? 8 : 4);
-      printf("fn link_abi_%06d_reloc_kind() -> i32 { return %d; }\n", id, id % 64);
-      printf("fn link_abi_%06d_section_flags() -> i32 { return %d; }\n", id, (id % 7));
-    }
-  }' >> "$LINKER"
-  n=$((n + 400))
-done
 
 # ---------------------------------------------------------------------------
 # 3. Real reference content for obasm.wa (written once, marker guarded)
@@ -484,21 +472,9 @@ WALL_EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Grow obasm.wa to at least 50 KiB with opcode descriptor blocks
+# 4. No synthetic opcode padding either; obasm.wa keeps only real reference
+#    entries and translated code.
 # ---------------------------------------------------------------------------
-OBASM_TARGET=56000
-m=0
-while [ "$(wc -c < "$OBASM")" -lt "$OBASM_TARGET" ]; do
-  awk -v base="$m" -v count=250 'BEGIN {
-    printf("// ---- generated assembler opcode block %06d ----\n", base);
-    for (i = 0; i < count; i++) {
-      id = base + i;
-      printf("global ASM_OPCODE_DESC_%06d: i32 = %d;\n", id, id % 1024);
-      printf("fn asm_opcode_%06d_width() -> i32 { return %d; }\n", id, 2 + (id % 4));
-    }
-  }' >> "$OBASM"
-  m=$((m + 250))
-done
 
 printf 'linker.wa: %s bytes\n' "$(wc -c < "$LINKER")"
 printf 'obasm.wa : %s bytes\n' "$(wc -c < "$OBASM")"

@@ -12,6 +12,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include "elfcomment.h"
+
+#ifndef WALL_DEFAULT_COMMENT
+#define WALL_DEFAULT_COMMENT "wallc version 1.0.0 (285fd1c)"
+#endif
 
 static int run_cmd(const char *cmd) {
   int rc = system(cmd);
@@ -46,9 +51,11 @@ int main(int argc, char **argv) {
   const char *in = NULL;
   const char *out = NULL;
   const char *mt = NULL;
+  const char *comment = NULL;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-o") == 0) { if (i + 1 < argc) out = argv[++i]; }
     else if (strncmp(argv[i], "--target=", 9) == 0) { mt = argv[i] + 9; }
+    else if (strncmp(argv[i], "--comment=", 10) == 0) { comment = argv[i] + 10; }
     else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { print_usage(stdout); return 0; }
     else if (argv[i][0] != '-') { in = argv[i]; }
   }
@@ -66,6 +73,16 @@ int main(int argc, char **argv) {
   if (assemble(in, bc, out, mt) != 0) {
     fprintf(stderr, "obasm: error: failed to assemble '%s'\n", in);
     return 1;
+  }
+  {
+    const char *cmt = (comment && comment[0]) ? comment : getenv("WALL_COMMENT");
+    if (!cmt || !cmt[0]) cmt = WALL_DEFAULT_COMMENT;
+    /* Objects produced by clang may have no .comment at all; the linker adds
+     * the Wall identity to the final ELF.  Only a real write failure warns. */
+    int rc = wall_elf_set_comment(out, cmt);
+    if (rc != 0 && rc != -2) {
+      fprintf(stderr, "obasm: warning: could not rewrite .comment in '%s'\n", out);
+    }
   }
   return 0;
 }

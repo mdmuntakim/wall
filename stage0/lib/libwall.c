@@ -147,7 +147,7 @@ static void lex(Lexer *L) {
 }
 
 /* ---------------- AST ---------------- */
-typedef enum { ND_BLOCK, ND_LET, ND_IF, ND_WHILE, ND_FOR, ND_RETURN, ND_EXPR_STMT, ND_INT, ND_STR, ND_IDENT, ND_BIN, ND_CALL } NKind;
+typedef enum { ND_BLOCK, ND_LET, ND_IF, ND_WHILE, ND_FOR, ND_RETURN, ND_EXPR_STMT, ND_ASSIGN, ND_INT, ND_STR, ND_IDENT, ND_BIN, ND_CALL } NKind;
 typedef struct Node Node;
 struct Node {
   int kind; int line, col; int op; int ty; long long num; char *name;
@@ -372,6 +372,17 @@ static Node *parse_stmt(Parser *p) {
     }
   }
   Node *e = parse_expr(p, 0);
+  if (is_punct(cur(p), "=")) {
+    if (e->kind != ND_IDENT) { perr(p, "%d:%d: error: assignment target must be a variable", t->line, t->col); return NULL; }
+    adv(p);
+    Node *rhs = parse_expr(p, 0);
+    if (!accept_punct(p, ";")) { perr(p, "%d:%d: error: expected ';' after assignment", cur(p)->line, cur(p)->col); return NULL; }
+    Node *n = mk(ND_ASSIGN, t->line, t->col);
+    n->name = e->name;
+    n->a = rhs;
+    n->ty = e->ty;
+    return n;
+  }
   if (!accept_punct(p, ";")) { perr(p, "%d:%d: error: expected ';'", cur(p)->line, cur(p)->col); return NULL; }
   Node *n = mk(ND_EXPR_STMT, t->line, t->col);
   n->a = e;
@@ -584,13 +595,21 @@ static void gen_stmt(Gen *g, Node *n) {
   switch (n->kind) {
   case ND_LET: {
     Val v = gen_expr(g, n->a);
-    char vr[32];
+    char vr[32]; vr[0] = 0;
     for (int i = 0; i < g->nvars; i++) { if (g->varty[i] > 0 && strcmp(g->varnames[i], n->name) == 0) { snprintf(vr, sizeof(vr), "%s", g->varregs[i]); break; } }
     if (!vr[0]) break;
     buf_putf(&g->out, "  store %s %s, ptr %s\n", llvm_ty(v.ty), v.reg, vr);
     break;
   }
-  case ND_EXPR_STMT: { Val v = gen_expr(g, n->a); break; }
+  case ND_ASSIGN: {
+    Val v = gen_expr(g, n->a);
+    char vr[32]; vr[0] = 0;
+    for (int i = 0; i < g->nvars; i++) { if (g->varty[i] > 0 && strcmp(g->varnames[i], n->name) == 0) { snprintf(vr, sizeof(vr), "%s", g->varregs[i]); break; } }
+    if (vr[0]) { buf_putf(&g->out, "  store %s %s, ptr %s\n", llvm_ty(v.ty), v.reg, vr); break; }
+    for (int j = 0; j < g->ngns; j++) { if (g->gntys[j] > 0 && strcmp(g->gnames[j], n->name) == 0) { buf_putf(&g->out, "  store %s %s, ptr @%s\n", llvm_ty(v.ty), v.reg, g->gnames[j]); break; } }
+    break;
+  }
+  case ND_EXPR_STMT: { Val v = gen_expr(g, n->a); (void)v; break; }
   case ND_RETURN: {
     Node lit; memset(&lit, 0, sizeof(lit)); lit.kind = ND_INT; lit.ty = g->cur_ret; lit.num = 0;
     Val v = gen_expr(g, n->a ? n->a : &lit);
@@ -604,13 +623,13 @@ static void gen_stmt(Gen *g, Node *n) {
     snprintf(lb, sizeof(lb), "L%d", g->lblc); g->lblc++;
     snprintf(le, sizeof(le), "L%d", g->lblc); g->lblc++;
     snprintf(lf, sizeof(lf), "L%d", g->lblc); g->lblc++;
-    buf_putf(&g->out, "  br i1 %s, label %s, label %s\n", c.reg, lb, le);
+    buf_putf(&g->out, "  br i1 %s, label %%%s, label %%%s\n", c.reg, lb, le);
     g_label(g, lb);
     gen_stmts(g, n->kids[1]);
-    buf_putf(&g->out, "  br label %s\n", lf);
+    buf_putf(&g->out, "  br label %%%s\n", lf);
     g_label(g, le);
     if (n->kids[2]) gen_stmts(g, n->kids[2]);
-    buf_putf(&g->out, "  br label %s\n", lf);
+    buf_putf(&g->out, "  br label %%%s\n", lf);
     g_label(g, lf);
     g->dead = 0;
     break;
@@ -620,13 +639,13 @@ static void gen_stmt(Gen *g, Node *n) {
     snprintf(lc, sizeof(lc), "L%d", g->lblc); g->lblc++;
     snprintf(lb, sizeof(lb), "L%d", g->lblc); g->lblc++;
     snprintf(le, sizeof(le), "L%d", g->lblc); g->lblc++;
-    buf_putf(&g->out, "  br label %s\n", lc);
+    buf_putf(&g->out, "  br label %%%s\n", lc);
     g_label(g, lc);
     Val c = gen_expr(g, n->kids[0]);
-    buf_putf(&g->out, "  br i1 %s, label %s, label %s\n", c.reg, lb, le);
+    buf_putf(&g->out, "  br i1 %s, label %%%s, label %%%s\n", c.reg, lb, le);
     g_label(g, lb);
     gen_stmts(g, n->kids[1]);
-    buf_putf(&g->out, "  br label %s\n", lc);
+    buf_putf(&g->out, "  br label %%%s\n", lc);
     g_label(g, le);
     g->dead = 0;
     break;
@@ -649,15 +668,15 @@ static void gen_stmt(Gen *g, Node *n) {
     snprintf(lc, sizeof(lc), "L%d", g->lblc); g->lblc++;
     snprintf(lb, sizeof(lb), "L%d", g->lblc); g->lblc++;
     snprintf(le, sizeof(le), "L%d", g->lblc); g->lblc++;
-    buf_putf(&g->out, "  br label %s\n", lc);
+    buf_putf(&g->out, "  br label %%%s\n", lc);
     g_label(g, lc);
     Val c;
     if (n->kids[1]) c = gen_expr(g, n->kids[1]); else { Node lit; memset(&lit, 0, sizeof(lit)); lit.kind = ND_INT; lit.ty = T_BOOL; lit.num = 1; c = gen_expr(g, &lit); }
-    buf_putf(&g->out, "  br i1 %s, label %s, label %s\n", c.reg, lb, le);
+    buf_putf(&g->out, "  br i1 %s, label %%%s, label %%%s\n", c.reg, lb, le);
     g_label(g, lb);
     gen_stmts(g, n->kids[3]);
     if (n->kids[2]) { Val st = gen_expr(g, n->kids[2]); buf_putf(&g->out, "  store i32 %s, ptr %s\n", st.reg, g->varregs[varidx]); }
-    buf_putf(&g->out, "  br label %s\n", lc);
+    buf_putf(&g->out, "  br label %%%s\n", lc);
     g_label(g, le);
     g->dead = 0;
     break;
