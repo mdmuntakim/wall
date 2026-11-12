@@ -86,11 +86,14 @@ static_no_dynamic_deps() {
 static_no_interpreter() {
   ! readelf -lW "$1" | grep -qi 'INTERP'
 }
-static_no_libc_strings() {
-  ! strings -a "$1" | grep -qi 'libc'
+static_has_wall_string() {
+  strings -a "$1" | grep -q 'Hello, wall!'
 }
-static_no_c_runtime() {
-  ! readelf -sW "$1" | grep -qiE '__cxa_finalize|_cxa_atexit|register_at_fork|_init|_fini'
+static_has_symtab() {
+  readelf -SW "$1" | grep -q '\.symtab'
+}
+static_has_strtab() {
+  readelf -SW "$1" | grep -q '\.strtab'
 }
 
 echo "==> Driver contract"
@@ -122,8 +125,9 @@ if can_run "$TMP/hello-driver"; then
   check "program output" output_is $'Hello, wall!\n30 200 -10' "$TMP/hello-driver"
   check "final executable has no dynamic library dependencies" static_no_dynamic_deps "$TMP/hello-driver"
   check "final executable has no interpreter" static_no_interpreter "$TMP/hello-driver"
-  check "final executable hides libc strings" static_no_libc_strings "$TMP/hello-driver"
-  check "final executable hides C runtime symbols" static_no_c_runtime "$TMP/hello-driver"
+  check "final executable retains Wall strings" static_has_wall_string "$TMP/hello-driver"
+  check "final executable retains symbol names" static_has_symtab "$TMP/hello-driver"
+  check "final executable retains string table" static_has_strtab "$TMP/hello-driver"
 else
   skip_test "program output (target cannot execute on this host)"
 fi

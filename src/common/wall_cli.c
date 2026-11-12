@@ -25,7 +25,7 @@ const WallOption wall_options[] = {
   OPT("Bshareable", 0, A0, NULL, "ld", "Produce a shared object", 1),
   OPT("static", 0, A0, NULL, "ld", "Produce a static executable", 1),
   OPT("pie", 0, A0, NULL, "ld", "Produce a position-independent executable", 1),
-  OPT("symbols", 's', A0, NULL, "ld", "Keep the symbol table (default stripped)", 1),
+  OPT("symbols", 's', A0, NULL, "ld", "Keep the symbol table (default kept)", 1),
   OPT("strip-all", 's', A0, NULL, "ld", "Strip all symbols", 1),
   OPT("strip-debug", 'S', A0, NULL, "ld", "Strip debug information", 1),
   OPT("strip-discarded", 0, A0, NULL, "ld", "Strip symbols of discarded sections", 1),

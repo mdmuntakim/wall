@@ -164,7 +164,7 @@ static Buf g_got;
 static uint64_t g_bss;
 static uint64_t g_text_addr, g_ro_addr, g_data_addr, g_bss_addr, g_got_addr;
 static int g_shared;
-static int g_strip = 1;   /* small binaries by default; --symbols keeps symtab */
+static int g_strip = 0;   /* keep .symtab/.strtab by default; --strip hides them */
 static int g_build_id;    /* --build-id */
 
 /* Option state for real GNU ld compatible behaviour. */
@@ -3475,7 +3475,7 @@ static void usage(FILE *f) {
     "  -e, --entry <sym>    Entry symbol (default: _start)\n"
     "  --shared             Produce a shared object (ET_DYN)\n"
     "  -r, --relocatable    Produce a relocatable object (ET_REL)\n"
-    "  --symbols            Keep .symtab/.strtab (default: stripped)\n"
+    "  --symbols            Keep .symtab/.strtab (default: kept)\n"
     "  --map=<file>         Write a layout and symbol map\n"
     "  -u <sym>             Force <sym> to be undefined (pulls archives)\n"
     "  --defsym=S=VAL       Define absolute symbol S with value VAL\n"

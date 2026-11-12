@@ -26,7 +26,8 @@ The integration suite verifies:
 - textual include resolution;
 - external global resolution across objects;
 - static output hygiene: no dynamic library dependencies, no ELF interpreter,
-  no libc strings, and no C runtime symbols in the final executable.
+  retains the Wall strings, symbol table, and string table; the final executable
+  is not stripped or hidden by default.
 
 When the build target cannot execute on the host (for example an AArch64
 cross-build on x86_64 CI), execution checks print `skip` and the structural

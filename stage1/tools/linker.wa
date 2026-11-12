@@ -172,7 +172,7 @@ let g_whole_archive: i32 = 0;
 // unsupported: static uint64_t g_bss;
 // unsupported: static uint64_t g_text_addr, g_ro_addr, g_data_addr, g_bss_addr, g_got_addr;
 let g_shared: i32 = 0;
-// unsupported: static int g_strip = 1;   //  small binaries by default; --symbols keeps symtab
+// unsupported: static int g_strip = 0;   //  keep .symtab/.strtab by default; --strip hides them
 // unsupported: static int g_build_id;    //  --build-id
 
 // unsupported: //  --build-id needs a fourth program header (PT_NOTE): 64 + 4*56 = 288.
@@ -3379,7 +3379,7 @@ fn usage(f: i32) -> i32 {
 // unsupported: "  -e, --entry <sym>    Entry symbol (default: _start)\n"
 // unsupported: "  --shared             Produce a shared object (ET_DYN)\n"
 // unsupported: "  -r, --relocatable    Produce a relocatable object (ET_REL)\n"
-// unsupported: "  --symbols            Keep .symtab/.strtab (default: stripped)\n"
+// unsupported: "  --symbols            Keep .symtab/.strtab (default: kept)\n"
 // unsupported: "  --map=<file>         Write a layout and symbol map\n"
 // unsupported: "  -u <sym>             Force <sym> to be undefined (pulls archives)\n"
 // unsupported: "  --defsym=S=VAL       Define absolute symbol S with value VAL\n"
