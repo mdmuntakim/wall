@@ -24,7 +24,9 @@ The integration suite verifies:
 - `--print-output-format`;
 - end-to-end execution when the host can run AArch64 binaries;
 - textual include resolution;
-- external global resolution across objects.
+- external global resolution across objects;
+- static output hygiene: no dynamic library dependencies, no ELF interpreter,
+  no libc strings, and no C runtime symbols in the final executable.
 
 When the build target cannot execute on the host (for example an AArch64
 cross-build on x86_64 CI), execution checks print `skip` and the structural

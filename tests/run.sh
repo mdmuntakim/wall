@@ -80,6 +80,18 @@ output_is() {
 can_run() {
   run_cmd "$@" >/dev/null 2>&1
 }
+static_no_dynamic_deps() {
+  [ -z "$(readelf -dW "$1" 2>&1 | grep -i 'NEEDED')" ]
+}
+static_no_interpreter() {
+  ! readelf -lW "$1" | grep -qi 'INTERP'
+}
+static_no_libc_strings() {
+  ! strings -a "$1" | grep -qi 'libc'
+}
+static_no_c_runtime() {
+  ! readelf -sW "$1" | grep -qiE '__cxa_finalize|_cxa_atexit|register_at_fork|_init|_fini'
+}
 
 echo "==> Driver contract"
 check "version is a wall version" is_wall_version ./wall
@@ -108,6 +120,10 @@ check "driver build" run_cmd ./wall tests/language/hello.wa -o "$TMP/hello-drive
 check "driver image is ELF" elf_magic "$TMP/hello-driver"
 if can_run "$TMP/hello-driver"; then
   check "program output" output_is $'Hello, wall!\n30 200 -10' "$TMP/hello-driver"
+  check "final executable has no dynamic library dependencies" static_no_dynamic_deps "$TMP/hello-driver"
+  check "final executable has no interpreter" static_no_interpreter "$TMP/hello-driver"
+  check "final executable hides libc strings" static_no_libc_strings "$TMP/hello-driver"
+  check "final executable hides C runtime symbols" static_no_c_runtime "$TMP/hello-driver"
 else
   skip_test "program output (target cannot execute on this host)"
 fi
