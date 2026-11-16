@@ -25,6 +25,10 @@
 #define WALL_DEFAULT_COMMENT "wall version 1.0.0"
 #endif
 
+#ifndef WALL_DEFAULT_TRIPLE
+#define WALL_DEFAULT_TRIPLE "aarch64-unknown-linux-android24"
+#endif
+
 #define MAX_FLAGS 96
 #define MAX_DEFSYMS 64
 
@@ -255,6 +259,7 @@ static int set_gnu_stack(const char *path, int exec) {
 int obasm_main(int argc, char **argv) {
   AsmOpts o;
   memset(&o, 0, sizeof(o));
+  o.triple = WALL_DEFAULT_TRIPLE;
   char outbuf[4096];
 
   for (int i = 1; i < argc; i++) {

@@ -814,6 +814,7 @@ int main(int argc, char **argv) {
   Drv d;
   memset(&d, 0, sizeof(d));
   d.opt_level = 0;
+  d.target = WALL_DEFAULT_TRIPLE;
 
   /* Compatibility symlinks. */
   if (!strcmp(prog, "obasm")) {

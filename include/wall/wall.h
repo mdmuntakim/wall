@@ -69,7 +69,7 @@ extern "C" {
 #define WALL_LANGUAGE_STD "wall21"
 
 /* The default target triple used when none is supplied. */
-#define WALL_DEFAULT_TRIPLE "aarch64-unknown-linux-android"
+#define WALL_DEFAULT_TRIPLE "aarch64-unknown-linux-android24"
 
 /* The name of the default backend shared library. */
 #define WALL_BACKEND_NAME "libwall.so"

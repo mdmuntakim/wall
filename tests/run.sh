@@ -61,7 +61,7 @@ help_has_no_examples() {
   ! run_cmd ./wall --help | grep -qi '^Examples:'
 }
 catalogue_available() {
-  run_cmd ./wall --help=all | grep -qi 'relocation'
+  run_cmd ./wall --help=all | grep -i 'relocation' > /dev/null
 }
 unknown_option_fails() {
   ! run_cmd ./wall --definitely-not-an-option >/dev/null 2>&1
