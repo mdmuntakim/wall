@@ -1,0 +1,2774 @@
+// objc.wa - the Wall object assembler, written in Wall.
+//
+// Assembles GNU/LLVM-compatible AArch64 assembly (.s) into ELF64 relocatable
+// objects (.o).  No LLVM, no clang, no external assembler anywhere in this
+// path: the parser, the instruction encoders and the ELF writer below are
+// the whole tool.
+//
+// Usage:
+//   objc <input.s> -o <output.o> [--comment TEXT] [--version] [-h]
+//
+// Guarantees:
+//   - deterministic: identical input produces byte-identical output
+//   - errors are "file:line:column: error: message" with the offending line
+//     and a caret; exit code 1; no output file is written on failure
+//   - every object carries a `.comment` section stamping
+//       wall version <version> (<hash>)
+//     where <hash> is 16 hex characters derived from the SHA-256 of the
+//     output image with the .comment payload zeroed (so the stamp does not
+//     self-reference).  Override the text with --comment or WALL_COMMENT.
+//
+// The mnemonic table covers the AArch64 dialect emitted by the Wall compiler
+// (seedc) plus the common GNU directives used by the runtime and tests.
+
+include "../include/wallrt.wa";
+
+// --------------------------------------------------------------- version
+global OBJC_VERSION: *u8 = "2.0.0-m0";
+
+// --------------------------------------------------------------- constants
+global SHF_WRITE: i64 = 1;
+global SHF_ALLOC: i64 = 2;
+global SHF_EXECINSTR: i64 = 4;
+global SHF_GROUP: i64 = 512;
+
+global SHT_NULL: i64 = 0;
+global SHT_PROGBITS: i64 = 1;
+global SHT_SYMTAB: i64 = 2;
+global SHT_STRTAB: i64 = 3;
+global SHT_RELA: i64 = 4;
+global SHT_NOBITS: i64 = 8;
+global SHT_COMMENT: i64 = 23;
+
+global STB_LOCAL: i32 = 0;
+global STB_GLOBAL: i32 = 1;
+global STB_WEAK: i32 = 2;
+
+global STT_NOTYPE: i32 = 0;
+global STT_OBJECT: i32 = 1;
+global STT_FUNC: i32 = 2;
+global STT_SECTION: i32 = 3;
+
+global R_ABS64: i32 = 257;
+global R_ABS32: i32 = 258;
+global R_ABS16: i32 = 259;
+global R_PREL32: i32 = 261;
+global R_ADR_PREL_LO21: i32 = 274;
+global R_ADR_PREL_PG_HI21: i32 = 275;
+global R_ADD_ABS_LO12: i32 = 277;
+global R_LDST8_ABS_LO12: i32 = 278;
+global R_CONDBR19: i32 = 280;
+global R_TSTBR14: i32 = 279;
+global R_JUMP26: i32 = 282;
+global R_CALL26: i32 = 283;
+global R_LDST16_ABS_LO12: i32 = 284;
+global R_LDST32_ABS_LO12: i32 = 285;
+global R_LDST64_ABS_LO12: i32 = 286;
+global R_LDST128_ABS_LO12: i32 = 299;
+
+global EM_AARCH64: i64 = 183;
+
+// --------------------------------------------------------------- structs
+struct Sect {
+  name: *u8,
+  d: Buf,             // payload
+  al: i64,            // alignment
+  flags: i64,
+  kind: i32,          // 0 = progbits, 1 = nobits (.bss)
+  rela: Buf,          // 24-byte relocation records
+  idx: i32
+}
+
+struct SymRec {
+  name: *u8,
+  sec: i32,           // section index, -1 = undefined / absolute
+  off: i64,
+  bind: i32,
+  typ: i32,
+  size: i64,
+  value: i64,         // for absolute (.equ) symbols
+  abs: i32,           // 1 = absolute symbol
+  idx: i32
+}
+
+struct Rela {
+  off: i64,
+  sym: i32,           // symbol index (resolved at write time)
+  kind: i32,
+  addend: i64
+}
+
+// token kinds
+global TKW_IDENT: i32 = 0;
+global TKW_NUM: i32 = 1;
+global TKW_STR: i32 = 2;
+global TKW_PUNCT: i32 = 3;
+
+struct Tok {
+  kind: i32,
+  p: *u8,             // text (NUL-terminated copy)
+  v: i64,             // numeric value
+  line: i32,
+  col: i32
+}
+
+// --------------------------------------------------------------- tables
+global sects: *Sect = 0 as *Sect;
+global nsects: i32 = 0;
+global capsects: i32 = 0;
+
+global syms: *SymRec = 0 as *SymRec;
+global nsyms: i32 = 0;
+global capsyms: i32 = 0;
+
+global cursec: i32 = 0;
+// 1 = sizing pass, 2 = emit pass; read before its former declaration site
+global pass: i32 = 0;
+
+global src: *u8 = 0 as *u8;
+global srclen: i64 = 0;
+global srcname: *u8 = 0 as *u8;
+global errcount: i32 = 0;
+
+// output file name (for error messages about writing)
+global outname: *u8 = 0 as *u8;
+
+// the final image (built once, written only if no errors)
+global image: Buf;
+
+// .comment payload (without the section header fields)
+global comment_text: *u8 = 0 as *u8;
+
+// --------------------------------------------------------------- sections
+fn sect_find(name: *u8) -> i32 {
+  let i: i32 = 0;
+  while (i < nsects) {
+    if (rt_streq(sects[i].name, name)) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+fn sect_new(name: *u8, flags: i64, kind: i32, al: i64) -> i32 {
+  let i: i32 = sect_find(name);
+  if (i >= 0) { return i; }
+  if (nsects >= capsects) {
+    let nc: i32 = capsects * 2 + 8;
+    let ns: *Sect = rt_alloc((nc * 88) as i64);
+    rt_copy(ns, sects as *u8, (nsects * 88) as i64);
+    sects = ns;
+    capsects = nc;
+  }
+  let s: *Sect = (sects + nsects) as *Sect;
+  s.name = rt_strdup(name);
+  buf_init(&s.d);
+  buf_init(&s.rela);
+  s.al = al;
+  s.flags = flags;
+  s.kind = kind;
+  s.idx = nsects;
+  nsects += 1;
+  return s.idx;
+}
+
+fn sect_cur() -> *Sect {
+  return (sects + cursec) as *Sect;
+}
+
+// pad current section to alignment
+fn sect_align(al: i64) -> void {
+  let s: *Sect = sect_cur();
+  if (s.kind == 1) { return; }
+  let a: i64 = al;
+  if (a <= 1) { return; }
+  while ((s.d.len % a) != 0) {
+    buf_putb(&s.d, 0);
+  }
+  if (a > s.al) { s.al = a; }
+}
+
+// Alignment in either pass: pass 1 zero-fills, pass 2 advances the length
+// over the placeholder bytes so offsets stay in step with pass 1.
+fn align_here(al: i64) -> void {
+  if (al <= 1) { return; }
+  let s: *Sect = sect_cur();
+  if (s.kind == 1) {
+    s.d.len = (s.d.len + al - 1) / al * al;
+    if (al > s.al) { s.al = al; }
+    return;
+  }
+  if (pass == 1) {
+    sect_align(al);
+  } else {
+    s.d.len = (s.d.len + al - 1) / al * al;
+  }
+}
+
+// --------------------------------------------------------------- symbols
+fn sym_find(name: *u8) -> i32 {
+  let i: i32 = 0;
+  while (i < nsyms) {
+    if (rt_streq(syms[i].name, name)) { return i; }
+    i += 1;
+  }
+  return -1;
+}
+
+fn sym_intern(name: *u8) -> i32 {
+  let i: i32 = sym_find(name);
+  if (i >= 0) { return i; }
+  if (nsyms >= capsyms) {
+    let nc: i32 = capsyms * 2 + 16;
+    let ns: *SymRec = rt_alloc((nc * 80) as i64);
+    rt_copy(ns, syms as *u8, (nsyms * 80) as i64);
+    syms = ns;
+    capsyms = nc;
+  }
+  let s: *SymRec = (syms + nsyms) as *SymRec;
+  s.name = rt_strdup(name);
+  s.sec = -1;
+  s.off = 0;
+  s.bind = 0;
+  s.typ = 0;
+  s.size = 0;
+  s.value = 0;
+  s.abs = 0;
+  s.idx = nsyms;
+  nsyms += 1;
+  return s.idx;
+}
+
+// --------------------------------------------------------------- errors
+// Report "file:line:col: error: msg", the source line and a caret.
+fn report(line: i32, col: i32, msg: *u8) -> void {
+  errcount += 1;
+  print_err(srcname);
+  print_err(":");
+  print_i64(line as i64);
+  print_err(":");
+  print_i64(col as i64);
+  print_err(": error: ");
+  print_err(msg);
+  print_err("\n");
+  // print the offending line with a caret underneath
+  let i: i64 = 0;
+  let ln: i32 = 1;
+  let start: i64 = 0;
+  while (i < srclen && ln < line) {
+    if (src[i] == 10) { ln += 1; start = i + 1; }
+    i += 1;
+  }
+  let e: i64 = start;
+  while (e < srclen && src[e] != 10) {
+    e += 1;
+  }
+  if (e > start) {
+    rt_write(2, src + start, e - start);
+  }
+  rt_write(2, "\n", 1);
+  let k: i64 = 1;
+  while (k < col) {
+    rt_write(2, " ", 1);
+    k += 1;
+  }
+  rt_write(2, "^\n", 2);
+}
+
+fn err_tok(t: *Tok, msg: *u8) -> void {
+  report(t.line, t.col, msg);
+}
+
+// --------------------------------------------------------------- lexer
+// Tokenizes one logical line in place.  Returns tokens in the supplied
+// array; the count is the return value.
+fn is_ident_char(c: u8) -> bool {
+  if (c >= 'a' && c <= 'z') { return true; }
+  if (c >= 'A' && c <= 'Z') { return true; }
+  if (c >= '0' && c <= '9') { return true; }
+  if (c == '_') { return true; }
+  if (c == '$') { return true; }
+  return false;
+}
+
+fn is_digit(c: u8) -> bool {
+  return c >= '0' && c <= '9';
+}
+
+fn is_hex_digit(c: u8) -> bool {
+  if (is_digit(c)) { return true; }
+  if (c >= 'a' && c <= 'f') { return true; }
+  if (c >= 'A' && c <= 'F') { return true; }
+  return false;
+}
+
+// strip a comment from [p, e): handles // and /* */ (single-line remainder)
+fn strip_comment(p: *u8, e: *u8) -> *u8 {
+  let q: *u8 = p;
+  while (q < e) {
+    if (q[0] == '/' as u8 && q[1] == '/' as u8) { return q; }
+    if (q[0] == '/' as u8 && q[1] == '*' as u8) {
+      // consume through */
+      q += 2;
+      while (q + 1 < e && !(q[0] == '*' as u8 && q[1] == '/' as u8)) {
+        q += 1;
+      }
+      if (q + 1 < e) { q += 2; } else { return e; }
+      // blank out the comment region
+      rt_zero(p + 0, 0);   // no-op to keep types simple
+      continue;
+    }
+    q += 1;
+  }
+  return e;
+}
+
+// Tokenize the text between p and e (same line).  Tokens are appended to
+// toks (capacity cap); returns count.
+fn lex_line(p: *u8, e: *u8, line: i32, toks: *Tok, cap: i32) -> i32 {
+  let n: i32 = 0;
+  let q: *u8 = p;
+  while (q < e) {
+    let c: u8 = q[0];
+    if (c == ' ' as u8 || c == 9 as u8) {
+      q += 1;
+      continue;
+    }
+    if (n >= cap) { 
+      let m: *u8 = "too many tokens on line";
+      report(line, 1, m);
+      return n;
+    }
+    let t: *Tok = (toks + n) as *Tok;
+    t.kind = TKW_PUNCT;
+    t.p = q;
+    t.v = 0;
+    t.line = line;
+    t.col = (q - p + 1) as i32;
+    if (is_ident_char(c) && !is_digit(c)) {
+      t.kind = TKW_IDENT;
+      let s: i64 = 0;
+      while (q < e && is_ident_char(q[0])) {
+        q += 1;
+        s += 1;
+      }
+      t.v = s;              // ident length in t.v
+      n += 1;
+      continue;
+    }
+    if (is_digit(c)) {
+      t.kind = TKW_NUM;
+      if (c == '0' as u8 && (q[1] == 'x' as u8 || q[1] == 'X' as u8)) {
+        q += 2;
+        while (q < e && is_hex_digit(q[0])) {
+          t.v = t.v * 16 + q[0] as i64;
+          if (q[0] >= 'a' as u8) { t.v = t.v - 87; } else { t.v = t.v - 48; }
+          q += 1;
+        }
+      } else {
+        while (q < e && is_digit(q[0])) {
+          t.v = t.v * 10 + (q[0] - 48 as u8);
+          q += 1;
+        }
+      }
+      n += 1;
+      continue;
+    }
+    if (c == '"' as u8) {
+      t.kind = TKW_STR;
+      q += 1;
+      t.p = q;
+      let s: i64 = 0;
+      while (q < e && q[0] != '"' as u8) {
+        // escapes resolved later by unescape
+        q += 1;
+        s += 1;
+      }
+      t.v = s;
+      if (q < e) { q += 1; }
+      n += 1;
+      continue;
+    }
+    if (c == 39 as u8) {   // 'c' char literal
+      t.kind = TKW_NUM;
+      q += 1;
+      if (q < e && q[0] == 92 as u8) {   // backslash escape
+        q += 1;
+        let ec: u8 = q[0];
+        if (ec == 'n' as u8) { t.v = 10; }
+        else if (ec == 't' as u8) { t.v = 9; }
+        else if (ec == '0' as u8) { t.v = 0; }
+        else if (ec == 92 as u8) { t.v = 92; }
+        else if (ec == 39 as u8) { t.v = 39; }
+        else { t.v = ec; }
+        q += 1;
+      } else {
+        t.v = q[0] as i64;
+        q += 1;
+      }
+      if (q < e && q[0] == 39 as u8) { q += 1; }
+      n += 1;
+      continue;
+    }
+    // punctuation (single char; ':' handled by label logic, ':lo12:' below)
+    t.kind = TKW_PUNCT;
+    t.p = q;
+    t.v = 1;               // length 1
+    q += 1;
+    n += 1;
+  }
+  return n;
+}
+
+// Un-escape a string literal body (in place semantics: returns new copy).
+fn unescape(p: *u8, n: i64, out: *Buf) -> void {
+  let i: i64 = 0;
+  while (i < n) {
+    let c: u8 = p[i];
+    if (c == 92 as u8 && i + 1 < n) {
+      i += 1;
+      let e: u8 = p[i];
+      if (e == 'n' as u8) { buf_putb(out, 10); }
+      else if (e == 't' as u8) { buf_putb(out, 9); }
+      else if (e == 'r' as u8) { buf_putb(out, 13); }
+      else if (e == '0' as u8) { buf_putb(out, 0); }
+      else if (e == 92 as u8) { buf_putb(out, 92); }
+      else if (e == 34 as u8) { buf_putb(out, 34); }
+      else if (e == 'x' as u8) {
+        let v: i64 = 0;
+        let k: i32 = 0;
+        while (k < 2 && i + 1 < n && is_hex_digit(p[i + 1])) {
+          i += 1;
+          let h: u8 = p[i];
+          v = v * 16;
+          if (h <= '9' as u8) { v += h - 48 as u8; }
+          else if (h <= 'F' as u8) { v += h - 55 as u8; }
+          else { v += h - 87 as u8; }
+          k += 1;
+        }
+        buf_putb(out, v as u8);
+      }
+      else { buf_putb(out, e); }
+      i += 1;
+      continue;
+    }
+    buf_putb(out, c);
+    i += 1;
+  }
+}
+
+// --------------------------------------------------------------- expressions
+// Expression value: either a constant, or a symbol reference plus addend.
+struct Expr {
+  val: i64,          // constant (or addend when sym is set)
+  sym: i32,          // symbol index, -1 if pure constant
+  xlate: i32         // 1 = had a :lo12: marker
+}
+
+fn expr_err(t: *Tok, m: *u8) -> void {
+  err_tok(t, m);
+}
+
+// parse_prim_level: number, symbol, location counter, (expr)
+fn parse_prim_level(toks: *Tok, ntoks: i32, pos: *i32, out: *Expr) -> void {
+  if (pos[0] >= ntoks) {
+    let m: *u8 = "unexpected end of expression";
+    err_tok(&toks[ntoks - 1], m);
+    out.sym = -1;
+    out.val = 0;
+    return;
+  }
+  let t: *Tok = (toks + pos[0]) as *Tok;
+  if (t.kind == TKW_NUM) {
+    out.val = t.v;
+    out.sym = -1;
+    pos[0] += 1;
+    return;
+  }
+  if (t.kind == TKW_IDENT) {
+    let namebuf: [128]u8;
+    rt_copy(namebuf, t.p, t.v);
+    namebuf[t.v] = 0;
+    pos[0] += 1;
+    out.sym = sym_intern(namebuf);
+    out.val = 0;
+    return;
+  }
+  if (t.kind == TKW_PUNCT && t.p[0] == '.' as u8 && t.v == 1) {
+    pos[0] += 1;
+    out.sym = -1;
+    out.val = sect_cur().d.len as i64;
+    return;
+  }
+  if (t.kind == TKW_PUNCT && t.p[0] == '(' as u8) {
+    pos[0] += 1;
+    parse_expr_at(toks, ntoks, pos, out);
+    if (pos[0] < ntoks && toks[pos[0]].kind == TKW_PUNCT && toks[pos[0]].p[0] == ')' as u8) {
+      pos[0] += 1;
+    } else {
+      let m: *u8 = "expected ) in expression";
+      err_tok(t, m);
+    }
+    return;
+  }
+  let m: *u8 = "expected expression";
+  err_tok(t, m);
+  pos[0] += 1;
+  out.sym = -1;
+  out.val = 0;
+}
+
+// parse_mul_level: * / << >>
+fn parse_mul_level(toks: *Tok, ntoks: i32, pos: *i32, out: *Expr) -> void {
+  parse_prim_level(toks, ntoks, pos, out);
+  let guard: i32 = 0;
+  while (pos[0] < ntoks && guard < 512) {
+    guard += 1;
+    if (!(toks[pos[0]].kind == TKW_PUNCT)) { break; }
+    let opc: u8 = toks[pos[0]].p[0];
+    let op: i32 = 0;
+    if (opc == '*' as u8 && toks[pos[0]].v == 1) { op = 1; }
+    else if (opc == '/' as u8 && toks[pos[0]].v == 1) { op = 2; }
+    else if (opc == '<' as u8 && pos[0] + 1 < ntoks
+             && toks[pos[0] + 1].kind == TKW_PUNCT && toks[pos[0] + 1].p[0] == '<' as u8) { op = 3; }
+    else if (opc == '>' as u8 && pos[0] + 1 < ntoks
+             && toks[pos[0] + 1].kind == TKW_PUNCT && toks[pos[0] + 1].p[0] == '>' as u8) { op = 4; }
+    else break;
+    let t: *Tok = (toks + pos[0]) as *Tok;
+    if (op >= 3) { pos[0] += 2; } else { pos[0] += 1; }
+    let rhs: Expr;
+    rhs.val = 0;
+    rhs.sym = -1;
+    rhs.xlate = 0;
+    parse_prim_level(toks, ntoks, pos, &rhs);
+    if (out.sym >= 0 || rhs.sym >= 0) {
+      let m: *u8 = "arithmetic on symbols not supported here";
+      err_tok(t, m);
+    }
+    if (op == 1) { out.val = out.val * rhs.val; }
+    else if (op == 2) { out.val = out.val / rhs.val; }
+    else if (op == 3) { out.val = out.val << rhs.val; }
+    else { out.val = (out.val as u64 >> rhs.val) as i64; }
+  }
+}
+
+fn parse_add_level(toks: *Tok, ntoks: i32, pos: *i32, out: *Expr) -> void {
+  parse_mul_level(toks, ntoks, pos, out);
+  let guard: i32 = 0;
+  while (pos[0] < ntoks && guard < 512) {
+    guard += 1;
+    if (!(toks[pos[0]].kind == TKW_PUNCT)) { break; }
+    let opc: u8 = toks[pos[0]].p[0];
+    let opl: i64 = toks[pos[0]].v;
+    let op: i32 = 0;
+    if (opc == '+' as u8 && opl == 1) { op = 1; }
+    else if (opc == '-' as u8 && opl == 1) { op = 2; }
+    else break;
+    let t: *Tok = (toks + pos[0]) as *Tok;
+    pos[0] += 1;
+    let rhs: Expr;
+    rhs.val = 0;
+    rhs.sym = -1;
+    rhs.xlate = 0;
+    parse_mul_level(toks, ntoks, pos, &rhs);
+    if (op == 1) {
+      if (lhs_check(out) && rhs.sym >= 0) {
+        let m: *u8 = "cannot add two symbols";
+        err_tok(t, m);
+      } else if (out.sym >= 0) { out.val += rhs.val; }
+      else if (rhs.sym >= 0) { out.sym = rhs.sym; out.val = rhs.val; }
+      else { out.val += rhs.val; }
+    } else {
+      if (out.sym >= 0 && rhs.sym >= 0) {
+        let s1: *SymRec = (syms + out.sym) as *SymRec;
+        let s2: *SymRec = (syms + rhs.sym) as *SymRec;
+        if (s1.sec >= 0 && s1.sec == s2.sec && s1.abs == 0 && s2.abs == 0) {
+          out.val = (s1.off + out.val) - (s2.off + rhs.val);
+          out.sym = -1;
+        } else {
+          let m: *u8 = "unsupported symbol subtraction";
+          err_tok(t, m);
+        }
+      } else if (out.sym >= 0) { out.val -= rhs.val; }
+      else { out.val -= rhs.val; }
+    }
+  }
+}
+
+fn lhs_check(e: *Expr) -> bool {
+  return e.sym >= 0;
+}
+
+// full expression: bitwise level (| & ^) above additive level
+fn parse_expr_at(toks: *Tok, ntoks: i32, pos: *i32, out: *Expr) -> void {
+  out.val = 0;
+  out.sym = -1;
+  out.xlate = 0;
+  // unary + - ~
+  if (pos[0] < ntoks && toks[pos[0]].kind == TKW_PUNCT) {
+    let u: u8 = toks[pos[0]].p[0];
+    if (u == '-' as u8 && toks[pos[0]].v == 1) {
+      pos[0] += 1;
+      parse_expr_at(toks, ntoks, pos, out);
+      if (out.sym >= 0) {
+        let m: *u8 = "unary minus on symbol not supported";
+        err_tok(&toks[pos[0] - 1], m);
+      }
+      out.val = -out.val;
+      return;
+    }
+    if (u == '~' as u8) {
+      pos[0] += 1;
+      parse_expr_at(toks, ntoks, pos, out);
+      out.val = ~out.val;
+      return;
+    }
+  }
+  parse_add_level(toks, ntoks, pos, out);
+  let guard: i32 = 0;
+  while (pos[0] < ntoks && guard < 512) {
+    guard += 1;
+    if (!(toks[pos[0]].kind == TKW_PUNCT)) { break; }
+    let opc: u8 = toks[pos[0]].p[0];
+    let opl: i64 = toks[pos[0]].v;
+    let op: i32 = 0;
+    if (opc == '|' as u8 && opl == 1) { op = 1; }
+    else if (opc == '&' as u8 && opl == 1) { op = 2; }
+    else if (opc == '^' as u8 && opl == 1) { op = 3; }
+    else break;
+    pos[0] += 1;
+    let rhs: Expr;
+    rhs.val = 0;
+    rhs.sym = -1;
+    rhs.xlate = 0;
+    parse_add_level(toks, ntoks, pos, &rhs);
+    if (out.sym >= 0 || rhs.sym >= 0) {
+      let m: *u8 = "bitwise arithmetic on symbols not supported";
+      err_tok(&toks[pos[0] - 1], m);
+    }
+    if (op == 1) { out.val = out.val | rhs.val; }
+    else if (op == 2) { out.val = out.val & rhs.val; }
+    else { out.val = out.val ^ rhs.val; }
+  }
+}
+
+// look ahead for a ':lo12:' (or '#:lo12:') marker before an identifier and
+// consume it, setting xlate.
+fn check_lo12(toks: *Tok, ntoks: i32, pos: *i32, out: *Expr) -> void {
+  let p: i32 = pos[0];
+  if (p < ntoks && toks[p].kind == TKW_PUNCT && toks[p].p[0] == '#' as u8 && toks[p].v == 1) {
+    p += 1;
+  }
+  if (p + 2 < ntoks
+      && toks[p].kind == TKW_PUNCT && toks[p].p[0] == ':' as u8 && toks[p].v == 1
+      && toks[p + 1].kind == TKW_IDENT && toks[p + 1].v == 4
+      && toks[p + 2].kind == TKW_PUNCT && toks[p + 2].p[0] == ':' as u8 && toks[p + 2].v == 1) {
+    if (toks[p + 1].p[0] == 'l' as u8 && toks[p + 1].p[1] == 'o' as u8
+        && toks[p + 1].p[2] == '1' as u8 && toks[p + 1].p[3] == '2' as u8) {
+      p += 3;
+      pos[0] = p;
+      out.xlate = 1;
+      return;
+    }
+  }
+}
+
+// resolve an expression to a constant if possible
+fn expr_const(e: *Expr, line: i32, col: i32) -> i64 {
+  if (e.sym >= 0) {
+    let s: *SymRec = (syms + e.sym) as *SymRec;
+    if (s.abs != 0) { return s.value + e.val; }
+    if (s.sec >= 0) { return s.off + e.val; }
+    let m: *u8 = "undefined symbol in constant expression";
+    report(line, col, m);
+    return 0;
+  }
+  return e.val;
+}
+
+// --------------------------------------------------------------- registers
+// Returns register number (0..30) or special: 31 = ZR, 32 = SP.
+// is64 set to 1 for x names.  Returns -1 on parse failure.
+fn parse_reg(t: *Tok, is64: *i32) -> i32 {
+  if (t.kind != TKW_IDENT) { return -1; }
+  let n: i64 = t.v;
+  if (n < 2) { return -1; }
+  let c0: u8 = t.p[0];
+  if (c0 == 'x' as u8 || c0 == 'w' as u8) {
+    is64[0] = (c0 == 'x' as u8) as i32;
+    if (n == 3 && t.p[1] == 'z' as u8 && t.p[2] == 'r' as u8) { return 31; }
+    if (n == 2 && t.p[1] == 's' as u8 && c0 == 'x' as u8) {
+      // "xs"? not a register
+    }
+    // number 0..30
+    if (n == 2 && is_digit(t.p[1])) {
+      let v: i32 = t.p[1] - 48 as u8;
+      if (v <= 30) { return v; }
+      return -1;
+    }
+    if (n == 3 && is_digit(t.p[1]) && is_digit(t.p[2])) {
+      let v: i32 = (t.p[1] - 48 as u8) * 10 + (t.p[2] - 48 as u8);
+      if (v <= 30) { return v; }
+      return -1;
+    }
+    return -1;
+  }
+  if (c0 == 's' as u8 && n == 2 && t.p[1] == 'p' as u8) {
+    is64[0] = 1;
+    return 32;
+  }
+  return -1;
+}
+
+// --------------------------------------------------------------- operands
+global OP_REG: i32 = 0;
+global OP_IMM: i32 = 1;
+global OP_MEM: i32 = 2;
+
+struct Opnd {
+  kind: i32,
+  rnum: i32,
+  is64: i32,
+  e: Expr,
+  base: i32,       // mem: base register
+  b64: i32,
+  offreg: i32,     // mem: register offset, -1 none
+  offs64: i32,
+  offscale: i32,   // mem: extend/scale marker: 0 none, else lsl amount
+  imm: i64,        // mem: immediate offset
+  memmode: i32     // 0 offset, 1 pre-index, 2 post-index
+}
+
+// Split a comma-separated operand list at bracket depth 0.
+// Returns the number of operands; bounds are recorded in starts/ends
+// (token index ranges).
+fn split_operands(toks: *Tok, ntoks: i32, start: i32, starts: *i32, ends: *i32, maxop: i32) -> i32 {
+  let n: i32 = 0;
+  let depth: i32 = 0;
+  let i: i32 = start;
+  let opstart: i32 = start;
+  while (i < ntoks) {
+    if (toks[i].kind == TKW_PUNCT) {
+      let c: u8 = toks[i].p[0];
+      if (c == '[' as u8 || c == '(' as u8) { depth += 1; }
+      else if (c == ']' as u8 || c == ')' as u8) { depth -= 1; }
+      else if (c == ',' as u8 && depth == 0) {
+        if (n < maxop) { starts[n] = opstart; ends[n] = i; n += 1; }
+        opstart = i + 1;
+      }
+    }
+    i += 1;
+  }
+  if (n < maxop && opstart < ntoks) { starts[n] = opstart; ends[n] = ntoks; n += 1; }
+  return n;
+}
+
+// Parse one operand from tokens [a, b).
+fn parse_operand(toks: *Tok, a: i32, b: i32, o: *Opnd, line: i32) -> void {
+  o.kind = OP_IMM;
+  o.rnum = -1;
+  o.is64 = 1;
+  o.base = -1;
+  o.offreg = -1;
+  o.imm = 0;
+  o.memmode = 0;
+  o.offscale = 0;
+  if (a >= b) {
+    let m: *u8 = "empty operand";
+    report(line, 1, m);
+    return;
+  }
+  // skip a leading '#' on immediate operands
+  if (toks[a].kind == TKW_PUNCT && toks[a].p[0] == '#' as u8) {
+    if (a + 1 >= b) {
+      let m0: *u8 = "missing immediate after #";
+      report(line, toks[a].col, m0);
+      return;
+    }
+    a += 1;
+  }
+  // memory operand?
+  if (toks[a].kind == TKW_PUNCT && toks[a].p[0] == '[' as u8) {
+    o.kind = OP_MEM;
+    let i: i32 = a + 1;
+    let is64: i32 = 1;
+    o.base = parse_reg(&toks[i], &is64);
+    o.b64 = is64;
+    i += 1;
+    if (o.base < 0) {
+      let m: *u8 = "expected base register";
+      report(line, toks[a].col, m);
+      return;
+    }
+    // [x0]            -> next is ]
+    // [x0, ...]       -> comma then details
+    if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == ']' as u8) {
+      i += 1;
+      // post-index with writeback? "[x0], #8"
+      if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == ',' as u8) {
+        o.memmode = 2;
+        i += 1;
+        // parse the post-index expression
+        let p2: i32 = i;
+        // skip '#' if present
+        if (p2 < b && toks[p2].kind == TKW_PUNCT && toks[p2].p[0] == '#' as u8) { p2 += 1; }
+        let ex: Expr;
+        ex.val = 0;
+        ex.sym = -1;
+        ex.xlate = 0;
+        parse_expr_at(toks, b, &p2, &ex);
+        o.e = ex;
+        o.imm = ex.val;   // symbols resolved by the encoder (fold or reloc)
+      }
+      if (i != b) {
+        let m: *u8 = "junk after memory operand";
+        report(line, toks[i].col, m);
+      }
+      return;
+    }
+    if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == ',' as u8) {
+      i += 1;
+    } else {
+      let m: *u8 = "expected , or ] in memory operand";
+      report(line, toks[i].col, m);
+      return;
+    }
+    // offset: '#' imm | reg {, lsl #n} | imm-expr (possibly :lo12:sym)
+    if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == '#' as u8) { i += 1; }
+    if (i < b && toks[i].kind == TKW_IDENT) {
+      let is64b: i32 = 1;
+      let rn: i32 = parse_reg(&toks[i], &is64b);
+      if (rn >= 0) {
+        o.offreg = rn;
+        o.offs64 = is64b;
+        i += 1;
+        // optional ", lsl #n"
+        if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == ',' as u8) {
+          i += 1;
+          if (i < b && toks[i].kind == TKW_IDENT && toks[i].v == 3
+              && toks[i].p[0] == 'l' as u8 && toks[i].p[1] == 's' as u8 && toks[i].p[2] == 'l' as u8) {
+            i += 1;
+            if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == '#' as u8) { i += 1; }
+            if (i < b && toks[i].kind == TKW_NUM) {
+              o.offscale = toks[i].v as i32;
+              i += 1;
+            }
+          }
+        }
+      } else {
+        // expression offset
+        let p2: i32 = i;
+        let ex: Expr;
+        ex.val = 0;
+        ex.sym = -1;
+        ex.xlate = 0;
+        check_lo12(toks, b, &p2, &ex);
+        parse_expr_at(toks, b, &p2, &ex);
+        o.e = ex;
+        o.imm = ex.val;   // symbols resolved by the encoder (fold or reloc)
+        i = p2;
+      }
+    } else {
+      let p2: i32 = i;
+      let ex: Expr;
+      ex.val = 0;
+      ex.sym = -1;
+      ex.xlate = 0;
+      check_lo12(toks, b, &p2, &ex);
+      parse_expr_at(toks, b, &p2, &ex);
+      o.e = ex;
+      o.imm = ex.val;   // symbols resolved by the encoder (fold or reloc)
+      i = p2;
+    }
+    // closing bracket and optional '!'
+    if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == ']' as u8) {
+      i += 1;
+      if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == '!' as u8) {
+        o.memmode = 1;
+        i += 1;
+      }
+    } else {
+      let m: *u8 = "expected ] in memory operand";
+      report(line, toks[i].col, m);
+      return;
+    }
+    if (i != b) {
+      let m: *u8 = "junk after memory operand";
+      report(line, toks[i].col, m);
+    }
+    return;
+  }
+  // register?
+  {
+    let is64b: i32 = 1;
+    let rn: i32 = parse_reg(&toks[a], &is64b);
+    if (rn >= 0) {
+      if (a + 1 != b) {
+        let m: *u8 = "junk after register";
+        report(line, toks[a].col, m);
+      }
+      o.kind = OP_REG;
+      o.rnum = rn;
+      o.is64 = is64b;
+      return;
+    }
+  }
+  // immediate / expression
+  {
+    let p2: i32 = a;
+    let ex: Expr;
+    ex.val = 0;
+    ex.sym = -1;
+    ex.xlate = 0;
+    check_lo12(toks, b, &p2, &ex);
+    parse_expr_at(toks, b, &p2, &ex);
+    o.e = ex;
+    o.imm = ex.val;   // symbols resolved by the encoder (fold or reloc)
+    if (p2 != b) {
+      let m: *u8 = "junk after expression";
+      report(line, toks[p2].col, m);
+    }
+  }
+}
+
+// --------------------------------------------------------------- lines
+struct LineRec {
+  p: *u8,        // text pointer (NUL-terminated not guaranteed; use len)
+  len: i64,
+  line: i32,
+  file: i32      // index into file table (for include-style errors)
+}
+
+global lines: *LineRec = 0 as *LineRec;
+global nlines: i32 = 0;
+global caplines: i32 = 0;
+
+// expanded output stream (what pass1/pass2 see)
+global olines: *LineRec = 0 as *LineRec;
+global nolines: i32 = 0;
+global capolines: i32 = 0;
+
+fn line_push(p: *u8, len: i64, lineno: i32) -> void {
+  if (nolines >= capolines) {
+    let nc: i32 = capolines * 2 + 256;
+    let na: *LineRec = rt_alloc((nc * 32) as i64);
+    rt_copy(na, olines as *u8, (nolines * 32) as i64);
+    olines = na;
+    capolines = nc;
+  }
+  let l: *LineRec = (olines + nolines) as *LineRec;
+  l.p = p;
+  l.len = len;
+  l.line = lineno;
+  nolines += 1;
+}
+
+// Split source into lines (pointers into the source buffer).
+fn split_lines(text: *u8, len: i64) -> void {
+  let i: i64 = 0;
+  let start: i64 = 0;
+  let ln: i32 = 1;
+  while (i < len) {
+    if (text[i] == 10) {
+      raw_push(text + start, i - start, ln);
+      ln += 1;
+      start = i + 1;
+    }
+    i += 1;
+  }
+  if (start < len) { raw_push(text + start, len - start, ln); }
+}
+
+fn raw_push(p: *u8, len: i64, lineno: i32) -> void {
+  if (nlines >= caplines) {
+    let nc: i32 = caplines * 2 + 256;
+    let na: *LineRec = rt_alloc((nc * 32) as i64);
+    rt_copy(na, lines as *u8, (nlines * 32) as i64);
+    lines = na;
+    caplines = nc;
+  }
+  let l: *LineRec = (lines + nlines) as *LineRec;
+  l.p = p;
+  l.len = len;
+  l.line = lineno;
+  nlines += 1;
+}
+
+// --------------------------------------------------------------- macros
+struct MacroDef {
+  name: *u8,
+  params: [8]*u8,
+  nparams: i32,
+  body: [256]i32   // line indices into a body storage
+}
+
+global macros: *MacroDef = 0 as *MacroDef;
+global nmacros: i32 = 0;
+
+// stored macro bodies: lines allocated at expansion time
+global maclines: *LineRec = 0 as *LineRec;
+global nmaclines: i32 = 0;
+global capmaclines: i32 = 0;
+
+fn macline_push(p: *u8, len: i64, lineno: i32) -> i32 {
+  if (nmaclines >= capmaclines) {
+    let nc: i32 = capmaclines * 2 + 256;
+    let na: *LineRec = rt_alloc((nc * 32) as i64);
+    rt_copy(na, maclines as *u8, (nmaclines * 32) as i64);
+    maclines = na;
+    capmaclines = nc;
+  }
+  let l: *LineRec = (maclines + nmaclines) as *LineRec;
+  l.p = p;
+  l.len = len;
+  l.line = lineno;
+  nmaclines += 1;
+  return nmaclines - 1;
+}
+
+fn macro_find(name: *u8, n: i64) -> i32 {
+  let i: i32 = 0;
+  while (i < nmacros) {
+    if ((macros + i) .nparams >= 0) {
+      let m: *MacroDef = (macros + i) as *MacroDef;
+      if (rt_strlen(m.name) == n) {
+        let same: bool = true;
+        let k: i64 = 0;
+        while (k < n) {
+          if (m.name[k] != name[k]) { same = false; }
+          k += 1;
+        }
+        if (same) { return i; }
+      }
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// --------------------------------------------------------------- .if stack
+global ifdepth: i32 = 0;
+global ifstate: [64]i32;    // 1 = emitting, 0 = skipping
+global ifdone: [64]i32;     // 1 = the true branch was already taken
+global ifwant: [64]i32;
+
+fn if_emitting() -> bool {
+  let d: i32 = 0;
+  while (d < ifdepth) {
+    if (ifstate[d] == 0) { return false; }
+    d += 1;
+  }
+  return true;
+}
+
+// --------------------------------------------------------------- pre-pass
+// Walks the raw lines; handles .rept/.endr, .macro/.endm, macro calls,
+// .if/.else/.endif, .equ/.set; fills `lines` with the expanded stream.
+fn preprocess() -> void {
+  let i: i32 = 0;
+  let toks: *Tok = rt_alloc(512 * 48);
+  let rept: i32 = 0;            // rept nesting
+  let reptcount: i64 = 0;
+  let reptstart: i32 = 0;
+  let inmacro: i32 = -1;        // macro being defined
+  let macstart: i32 = 0;
+
+  while (i < nlines) {
+    let l: *LineRec = (lines + i) as *LineRec;
+    let text: *u8 = l.p;
+    let len: i64 = l.len;
+    // lex a copy (do not mutate source) into the token buffer
+    let nt: i32 = lex_line(text, text + len, l.line, toks, 400);
+    let emitting: bool = if_emitting();
+
+    // find first token as the command word
+    let ci: i32 = 0;
+    if (nt > 0 && toks[0].kind == TKW_IDENT && toks[0].v == 1 && toks[0].p[0] == '.' as u8) {
+      ci = 0;   // hmm: '.' alone
+    }
+    // directives begin with '.'; the lexer includes '.' in idents, so
+    // a directive token is IDENT starting with '.'
+    let isdir: bool = false;
+    if (nt > 0 && toks[0].kind == TKW_IDENT && toks[0].v >= 2 && toks[0].p[0] == '.' as u8) {
+      isdir = true;
+    }
+
+    if (isdir && dir_is(text, len, ".endr")) {
+      if (rept > 0) {
+        // expand: repeat lines (reptstart+1 .. i-1) reptcount times
+        let r: i64 = 0;
+        while (r < reptcount) {
+          let j: i32 = reptstart + 1;
+          while (j < i) {
+            let lj: *LineRec = (lines + j) as *LineRec;
+            line_push(lj.p, lj.len, lj.line);
+            j += 1;
+          }
+          r += 1;
+        }
+        // remove rept lines? leave them; pass1 skips via emit control below
+        rept = 0;
+      }
+      i += 1;
+      continue;
+    }
+    if (isdir && dir_is(text, len, ".rept")) {
+      // parse count
+      let p2: i32 = 1;
+      let ex: Expr;
+      ex.val = 0;
+      ex.sym = -1;
+      ex.xlate = 0;
+      parse_expr_at(toks, nt, &p2, &ex);
+      rept = 1;
+      reptcount = expr_const(&ex, l.line, 1);
+      reptstart = i;
+      // suppress the original rept block lines during expansion
+      // (they are re-emitted by the expansion above)
+      // mark this line and the body as consumed by pushing nothing
+      i += 1;
+      // skip body lines until .endr (they were already consumed by the
+      // expansion loop at .endr time; skip here)
+      while (i < nlines && !dir_is(lines[i].p, lines[i].len, ".endr")) {
+        i += 1;
+      }
+      i += 1;   // past .endr
+      continue;
+    }
+    if (isdir && dir_is(text, len, ".macro")) {
+      // .macro name a, b, ...
+      if (nt < 2) {
+        let m: *u8 = ".macro needs a name";
+        report(l.line, 1, m);
+        i += 1;
+        continue;
+      }
+      let md: *MacroDef = (macros + nmacros) as *MacroDef;
+      let nm: [64]u8;
+      rt_copy(nm, toks[1].p, toks[1].v);
+      nm[toks[1].v] = 0;
+      md.name = rt_strdup(nm);
+      md.nparams = 0;
+      let k: i32 = 2;
+      while (k < nt) {
+        if (toks[k].kind == TKW_IDENT && md.nparams < 8) {
+          let pn: [64]u8;
+          rt_copy(pn, toks[k].p, toks[k].v);
+          pn[toks[k].v] = 0;
+          md.params[md.nparams] = rt_strdup(pn);
+          md.nparams += 1;
+        }
+        k += 1;
+      }
+      nmacros += 1;
+      inmacro = nmacros - 1;
+      macstart = nmaclines;
+      i += 1;
+      while (i < nlines && !dir_is(lines[i].p, lines[i].len, ".endm")) {
+        let lb: *LineRec = (lines + i) as *LineRec;
+        macline_push(lb.p, lb.len, lb.line);
+        i += 1;
+      }
+      i += 1;   // past .endm
+      continue;
+    }
+    if (inmacro >= 0) {
+      // handled above; should not reach
+      i += 1;
+      continue;
+    }
+    // macro invocation: first token matches a macro name and is not a label
+    if (!isdir && nt > 0 && toks[0].kind == TKW_IDENT) {
+      // skip label lines (contain a ':' punct)
+      let hascolon: bool = false;
+      let q: i32 = 0;
+      while (q < nt) {
+        if (toks[q].kind == TKW_PUNCT && toks[q].p[0] == ':' as u8) { hascolon = true; }
+        q += 1;
+      }
+      if (!hascolon) {
+        let mi: i32 = macro_find(toks[0].p, toks[0].v);
+        if (mi >= 0) {
+          let md: *MacroDef = (macros + mi) as *MacroDef;
+          // substitute \name for each argument, line by line
+          let j: i32 = macstart;
+          while (j < nmaclines) {
+            let ml: *LineRec = (maclines + j) as *LineRec;
+            expand_macro_line(md, ml, toks, nt, l.line);
+            j += 1;
+          }
+          i += 1;
+          continue;
+        }
+      }
+    }
+    if (isdir && (dir_is(text, len, ".if"))) {
+      ifdepth += 1;
+      ifwant[ifdepth - 1] = 1;
+      ifdone[ifdepth - 1] = 0;
+      if (emitting) {
+        let p2: i32 = 1;
+        let ex: Expr;
+        ex.val = 0;
+        ex.sym = -1;
+        ex.xlate = 0;
+        parse_expr_at(toks, nt, &p2, &ex);
+        let v: i64 = expr_const(&ex, l.line, 1);
+        ifwant[ifdepth - 1] = 1;
+        if (v != 0) {
+          ifstate[ifdepth - 1] = 1;
+          ifdone[ifdepth - 1] = 1;
+        } else {
+          ifstate[ifdepth - 1] = 0;
+        }
+      } else {
+        ifstate[ifdepth - 1] = 0;
+      }
+      i += 1;
+      continue;
+    }
+    if (isdir && dir_is(text, len, ".else")) {
+      if (ifdepth > 0) {
+        if (ifdone[ifdepth - 1] == 0 && ifwant[ifdepth - 1] == 1) {
+          ifstate[ifdepth - 1] = 1;
+          ifdone[ifdepth - 1] = 1;
+        } else {
+          ifstate[ifdepth - 1] = 0;
+        }
+      }
+      i += 1;
+      continue;
+    }
+    if (isdir && dir_is(text, len, ".endif")) {
+      if (ifdepth > 0) { ifdepth -= 1; }
+      i += 1;
+      continue;
+    }
+    if (isdir && (dir_is(text, len, ".equ") || dir_is(text, len, ".set"))) {
+      if (nt >= 3 && toks[1].kind == TKW_IDENT) {
+        let nm: [64]u8;
+        rt_copy(nm, toks[1].p, toks[1].v);
+        nm[toks[1].v] = 0;
+        let p2: i32 = 2;
+        if (p2 < nt && toks[p2].kind == TKW_PUNCT && toks[p2].p[0] == ',' as u8) { p2 += 1; }
+        let ex: Expr;
+        ex.val = 0;
+        ex.sym = -1;
+        ex.xlate = 0;
+        parse_expr_at(toks, nt, &p2, &ex);
+        let v: i64 = expr_const(&ex, l.line, 1);
+        let si: i32 = sym_intern(nm);
+        let sr: *SymRec = (syms + si) as *SymRec;
+        sr.abs = 1;
+        sr.value = v;
+        sr.sec = -1;
+      }
+      i += 1;
+      continue;
+    }
+    if (!emitting) {
+      i += 1;
+      continue;
+    }
+    line_push(l.p, l.len, l.line);
+    i += 1;
+  }
+}
+
+// compare a directive word at line start
+fn dir_is(text: *u8, len: i64, word: *u8) -> bool {
+  let wlen: i64 = rt_strlen(word);
+  if (len < wlen) { return false; }
+  let k: i64 = 0;
+  while (k < wlen) {
+    if (text[k] != word[k] as u8) { return false; }
+    k += 1;
+  }
+  if (len == wlen) { return true; }
+  let c: u8 = text[wlen];
+  if (c == ' ' as u8 || c == 9 as u8 || c == 44 as u8) { return true; }
+  return false;
+}
+
+// expand one macro body line with arguments, appending to lines
+fn expand_macro_line(md: *MacroDef, ml: *LineRec, args: *Tok, nargs: i32, lineno: i32) -> void {
+  let outb: Buf;
+  buf_init(&outb);
+  let i: i64 = 0;
+  let txt: *u8 = ml.p;
+  let n: i64 = ml.len;
+  while (i < n) {
+    if (txt[i] == 92 as u8 && i + 1 < n) {   // backslash
+      // \name or \N
+      let j: i64 = i + 1;
+      while (j < n && (is_ident_char(txt[j]))) {
+        j += 1;
+      }
+      if (j == i + 1) {
+        // lone backslash
+        buf_putb(&outb, 92);
+        i += 1;
+        continue;
+      }
+      let pn: [64]u8;
+      rt_copy(pn, txt + i + 1, j - i - 1);
+      pn[j - i - 1] = 0;
+      // numeric param? (\0..\7)
+      let substituted: bool = false;
+      let k: i32 = 0;
+      while (k < md.nparams) {
+        if (rt_streq(md.params[k], pn)) {
+          if (k + 1 < nargs) {
+            buf_append(&outb, args[k + 1].p, args[k + 1].v);
+          }
+          substituted = true;
+          break;
+        }
+        k += 1;
+      }
+      if (!substituted) {
+        buf_putb(&outb, 92);
+        buf_append(&outb, txt + i + 1, j - i - 1);
+      }
+      i = j;
+      continue;
+    }
+    buf_putb(&outb, txt[i]);
+    i += 1;
+  }
+  buf_putb(&outb, 0);
+  line_push(outb.data, outb.len - 1, lineno);
+}
+
+// --------------------------------------------------------------- pass 1
+// Compute section sizes, define labels.  Directive processing shared with
+// pass 2 through data_size()/data_encode().
+
+// pending symbol attributes (from .globl/.type/.size before/after def)
+global pendbind: i32 = -1;      // binding for next symbol
+global pendtype: i32 = -1;
+
+// numeric local labels (1:, 2: ...) - stacks of offsets per number
+global numlab_off: [16][64]i64;
+global numlab_sec: [16][64]i32;
+global numlab_n: [16]i32;
+
+fn numlab_define(n: i32, sec: i32, off: i64) -> void {
+  if (n >= 0 && n < 16 && numlab_n[n] < 64) {
+    numlab_off[n][numlab_n[n]] = off;
+    numlab_sec[n][numlab_n[n]] = sec;
+    numlab_n[n] += 1;
+  }
+}
+
+// resolve `Nb` (backward) or `Nf` (forward) from section/offset
+fn numlab_resolve(n: i32, back: i32, sec: i32, off: i64, rsec: *i32, roff: *i64) -> bool {
+  if (n < 0 || n >= 16) { return false; }
+  if (back != 0) {
+    let k: i32 = numlab_n[n] - 1;
+    while (k >= 0) {
+      if (numlab_sec[n][k] == sec) {
+        rsec[0] = sec;
+        roff[0] = numlab_off[n][k];
+        return true;
+      }
+      k -= 1;
+    }
+    return false;
+  }
+  // forward: the label does not exist yet at reference time in pass 2
+  // unless we are past it; find first entry AFTER off
+  let k: i32 = 0;
+  while (k < numlab_n[n]) {
+    if (numlab_sec[n][k] == sec && numlab_off[n][k] > off) {
+      rsec[0] = sec;
+      roff[0] = numlab_off[n][k];
+      return true;
+    }
+    k += 1;
+  }
+  return false;
+}
+
+// strip comment, lex, and split off leading labels.
+// Returns token count; sets *ntoks; consumes labels (defining symbols).
+fn lex_and_labels(l: *LineRec, toks: *Tok) -> i32 {
+  // copy line into a scratch buffer with comments stripped
+  let scratch: *u8 = rt_alloc(l.len + 1);
+  rt_copy(scratch, l.p, l.len);
+  scratch[l.len] = 0;
+  let e: *u8 = strip_comment(scratch, scratch + l.len);
+  let nt: i32 = lex_line(scratch, e, l.line, toks, 400);
+  // leading labels: IDENT ':' (possibly several)
+  let i: i32 = 0;
+  while (i + 1 < nt
+         && toks[i].kind == TKW_IDENT
+         && toks[i + 1].kind == TKW_PUNCT && toks[i + 1].p[0] == ':' as u8 && toks[i + 1].v == 1) {
+    let nm: [128]u8;
+    rt_copy(nm, toks[i].p, toks[i].v);
+    nm[toks[i].v] = 0;
+    // numeric local label?
+    if (nm[0] >= '0' as u8 && nm[0] <= '9' as u8 && nm[1] == 0) {
+      numlab_define(nm[0] - 48 as u8, cursec, sect_cur().d.len as i64);
+    } else {
+      let si: i32 = sym_intern(nm);
+      let sr: *SymRec = (syms + si) as *SymRec;
+      if (sr.sec >= 0) {
+        let m: *u8 = "duplicate symbol definition";
+        report(l.line, toks[i].col, m);
+      }
+      sr.sec = cursec;
+      sr.off = sect_cur().d.len as i64;
+      if (pendbind >= 0) { sr.bind = pendbind; }
+      if (pendtype >= 0) { sr.typ = pendtype; }
+      sr.size = 0;
+    }
+    pendbind = -1;
+    pendtype = -1;
+    i += 2;
+  }
+  // shift remaining tokens down
+  if (i > 0) {
+    let k: i32 = 0;
+    while (i < nt) {
+      toks[k] = toks[i];
+      k += 1;
+      i += 1;
+    }
+    nt = k;
+  }
+  return nt;
+}
+
+// process one line in the current pass
+fn process_line(l: *LineRec) -> void {
+  let toks: *Tok = rt_alloc(400 * 48);
+  let nt: i32 = lex_and_labels(l, toks);
+  if (nt == 0) { return; }
+  // directive?
+  if (toks[0].kind == TKW_IDENT && toks[0].v >= 2 && toks[0].p[0] == '.' as u8) {
+    do_directive(l, toks, nt);
+    return;
+  }
+  // instruction: 4 bytes
+  if (toks[0].kind == TKW_IDENT) {
+    align_here(4);
+    if (pass == 1) {
+      buf_grow(&sect_cur().d, 4);
+      let i: i64 = 0;
+      while (i < 4) {
+        buf_putb(&sect_cur().d, 0);
+        i += 1;
+      }
+    }
+    if (pass == 2) {
+      encode_instruction(l, toks, nt);
+    }
+    return;
+  }
+  let m: *u8 = "unexpected token at instruction position";
+  report(l.line, toks[0].col, m);
+}
+
+// --------------------------------------------------------------- pass 2
+// Patch a 32-bit word into section data at off (little endian).
+fn poke32(sec: i32, off: i64, w: u32) -> void {
+  let s: *Sect = (sects + sec) as *Sect;
+  s.d.data[off + 0] = w as u8;
+  s.d.data[off + 1] = (w >> 8) as u8;
+  s.d.data[off + 2] = (w >> 16) as u8;
+  s.d.data[off + 3] = (w >> 24) as u8;
+}
+
+fn poke64(sec: i32, off: i64, v: u64) -> void {
+  let s: *Sect = (sects + sec) as *Sect;
+  let k: i32 = 0;
+  while (k < 8) {
+    s.d.data[off + k] = (v >> (8 * k)) as u8;
+    k += 1;
+  }
+}
+
+// add a relocation record to a section
+fn add_rela(sec: i32, off: i64, symidx: i32, kind: i32, addend: i64) -> void {
+  let s: *Sect = (sects + sec) as *Sect;
+  let r: Rela;
+  r.off = off;
+  r.sym = symidx;
+  r.kind = kind;
+  r.addend = addend;
+  buf_append(&s.rela, r as *u8, 24);
+}
+
+// --------------------------------------------------------------- directives
+fn sym_name_copy(t: *Tok, buf: *u8, cap: i64) -> void {
+  let n: i64 = t.v;
+  if (n > cap - 1) { n = cap - 1; }
+  rt_copy(buf, t.p, n);
+  buf[n] = 0;
+}
+
+fn do_directive(l: *LineRec, toks: *Tok, nt: i32) -> void {
+  let d: *Tok = &toks[0];
+  let dlen: i64 = d.v;
+  let dp: *u8 = d.p;
+  let line: i32 = l.line;
+
+  // ---- section switching
+  if (dlen == 5 && dp[0] == '.' as u8 && dp[1] == 't' as u8 && dp[2] == 'e' as u8 && dp[3] == 'x' as u8 && dp[4] == 't' as u8) {
+    cursec = sect_new(".text", SHF_ALLOC | SHF_EXECINSTR, 0, 4);
+    return;
+  }
+  if (dlen == 5 && dp[0] == '.' as u8 && dp[1] == 'd' as u8 && dp[2] == 'a' as u8 && dp[3] == 't' as u8 && dp[4] == 'a' as u8) {
+    cursec = sect_new(".data", SHF_ALLOC | SHF_WRITE, 0, 1);
+    return;
+  }
+  if (dlen == 4 && dp[1] == 'b' as u8 && dp[2] == 's' as u8 && dp[3] == 's' as u8) {
+    cursec = sect_new(".bss", SHF_ALLOC | SHF_WRITE, 1, 1);
+    return;
+  }
+  if (dlen == 7 && dp[1] == 'r' as u8 && dp[2] == 'o' as u8 && dp[3] == 'd' as u8 && dp[4] == 'a' as u8 && dp[5] == 't' as u8 && dp[6] == 'a' as u8) {
+    cursec = sect_new(".rodata", SHF_ALLOC, 0, 1);
+    return;
+  }
+  if (dlen == 8 && dp[1] == 's' as u8 && dp[2] == 'e' as u8 && dp[3] == 'c' as u8 && dp[4] == 't' as u8 && dp[5] == 'i' as u8 && dp[6] == 'o' as u8 && dp[7] == 'n' as u8) {
+    // .section name, "flags"
+    if (nt < 2 || toks[1].kind != TKW_IDENT) {
+      let m: *u8 = ".section needs a name";
+      report(line, 1, m);
+      return;
+    }
+    let nm: [128]u8;
+    sym_name_copy(&toks[1], nm, 128);
+    let flags: i64 = SHF_ALLOC;
+    let kind: i32 = 0;
+    if (nt >= 4 && toks[2].kind == TKW_PUNCT && toks[2].p[0] == ',' as u8 && toks[3].kind == TKW_STR) {
+      let k: i64 = 0;
+      while (k < toks[3].v) {
+        let fc: u8 = toks[3].p[k];
+        if (fc == 'w' as u8) { flags = flags | SHF_WRITE; }
+        else if (fc == 'a' as u8) { flags = flags | SHF_ALLOC; }
+        else if (fc == 'x' as u8) { flags = flags | SHF_EXECINSTR; }
+        else if (fc == 'M' as u8 || fc == 'S' as u8 || fc == 'G' as u8 || fc == 'T' as u8) {
+          // string/merge/group flags: accepted, recorded as nothing extra
+        }
+        else if (fc == '@' as u8 || fc == '%' as u8) {
+          // type marker: @progbits / @nobits
+          if (k + 1 < toks[3].v) {
+            let tc: u8 = toks[3].p[k + 1];
+            if (tc == 'n' as u8) { kind = 1; }   // nobits
+            k += 1;
+          }
+        }
+        k += 1;
+      }
+    }
+    cursec = sect_new(nm, flags, kind, 1);
+    return;
+  }
+  // ---- symbol binding
+  if (dlen == 6 && dp[1] == 'g' as u8 && dp[2] == 'l' as u8 && dp[3] == 'o' as u8 && dp[4] == 'b' as u8 && dp[5] == 'l' as u8) {
+    set_binding(l, toks, nt, STB_GLOBAL);
+    return;
+  }
+  if (dlen == 7 && dp[1] == 'g' as u8 && dp[2] == 'l' as u8 && dp[3] == 'o' as u8 && dp[4] == 'b' as u8 && dp[5] == 'a' as u8 && dp[6] == 'l' as u8) {
+    set_binding(l, toks, nt, STB_GLOBAL);
+    return;
+  }
+  if (dlen == 6 && dp[1] == 'l' as u8 && dp[2] == 'o' as u8 && dp[3] == 'c' as u8 && dp[4] == 'a' as u8 && dp[5] == 'l' as u8) {
+    set_binding(l, toks, nt, STB_LOCAL);
+    return;
+  }
+  if (dlen == 5 && dp[1] == 'w' as u8 && dp[2] == 'e' as u8 && dp[3] == 'a' as u8 && dp[4] == 'k' as u8) {
+    set_binding(l, toks, nt, STB_WEAK);
+    return;
+  }
+  // ---- .type
+  if (dlen == 5 && dp[1] == 't' as u8 && dp[2] == 'y' as u8 && dp[3] == 'p' as u8 && dp[4] == 'e' as u8) {
+    if (nt >= 3 && toks[1].kind == TKW_IDENT) {
+      let nm: [128]u8;
+      sym_name_copy(&toks[1], nm, 128);
+      let si: i32 = sym_intern(nm);
+      let sr: *SymRec = (syms + si) as *SymRec;
+      // %function / @function / %object / @object / %notype / @notype
+      let k: i32 = 2;
+      while (k < nt) {
+        let c: u8 = toks[k].p[0];
+        if (toks[k].kind == TKW_IDENT && toks[k].v >= 2 && (c == '%' as u8 || c == '@' as u8)) {
+          let w: *u8 = toks[k].p;
+          let wl: i64 = toks[k].v;
+          if (wl == 9 && w[1] == 'f' as u8) { sr.typ = STT_FUNC; }
+          else if (wl == 7 && w[1] == 'o' as u8) { sr.typ = STT_OBJECT; }
+          else if (wl == 7 && w[1] == 'n' as u8) { sr.typ = STT_NOTYPE; }
+          else if (wl == 8 && w[1] == 'g' as u8) { sr.typ = STT_NOTYPE; }  // gnu_unique_object
+        }
+        k += 1;
+      }
+    }
+    return;
+  }
+  // ---- .size
+  if (dlen == 5 && dp[1] == 's' as u8 && dp[2] == 'i' as u8 && dp[3] == 'z' as u8 && dp[4] == 'e' as u8) {
+    if (nt >= 3 && toks[1].kind == TKW_IDENT) {
+      let nm: [128]u8;
+      sym_name_copy(&toks[1], nm, 128);
+      let si: i32 = sym_intern(nm);
+      let p2: i32 = 2;
+      if (p2 < nt && toks[p2].kind == TKW_PUNCT && toks[p2].p[0] == ',' as u8) { p2 += 1; }
+      let ex: Expr;
+      ex.val = 0;
+      ex.sym = -1;
+      ex.xlate = 0;
+      parse_expr_at(toks, nt, &p2, &ex);
+      let sr: *SymRec = (syms + si) as *SymRec;
+      if (ex.sym < 0) { sr.size = ex.val; }
+      else {
+        // sym difference already folded by the expression parser
+        sr.size = expr_const(&ex, line, toks[2].col);
+      }
+    }
+    return;
+  }
+  // ---- .align / .p2align (power of two on AArch64)
+  if ((dlen == 6 && dp[1] == 'a' as u8 && dp[2] == 'l' as u8 && dp[3] == 'i' as u8 && dp[4] == 'g' as u8 && dp[5] == 'n' as u8)
+      || (dlen == 8 && dp[1] == 'p' as u8 && dp[2] == '2' as u8 && dp[3] == 'a' as u8 && dp[4] == 'l' as u8 && dp[5] == 'i' as u8 && dp[6] == 'g' as u8 && dp[7] == 'n' as u8)) {
+    if (nt >= 2 && toks[1].kind == TKW_NUM) {
+      let p2: i32 = 1;
+      let ex: Expr;
+      ex.val = 0;
+      ex.sym = -1;
+      ex.xlate = 0;
+      parse_expr_at(toks, nt, &p2, &ex);
+      let e: i64 = expr_const(&ex, line, toks[1].col);
+      let a: i64 = 1 << e;
+      if (pass == 1) {
+        sect_align(a);
+      }
+      // .bss alignment must also be remembered
+      if (a > sect_cur().al) { sect_cur().al = a; }
+    }
+    return;
+  }
+  // ---- data
+  if ((dlen == 5 && dp[1] == 'b' as u8 && dp[2] == 'y' as u8 && dp[3] == 't' as u8 && dp[4] == 'e' as u8)
+      || (dlen == 6 && dp[1] == 'h' as u8 && dp[2] == 'w' as u8 && dp[3] == 'o' as u8 && dp[4] == 'r' as u8 && dp[5] == 'd' as u8)
+      || (dlen == 6 && dp[1] == 's' as u8 && dp[2] == 'h' as u8 && dp[3] == 'o' as u8 && dp[4] == 'r' as u8 && dp[5] == 't' as u8)
+      || (dlen == 5 && dp[1] == 'w' as u8 && dp[2] == 'o' as u8 && dp[3] == 'r' as u8 && dp[4] == 'd' as u8)
+      || (dlen == 5 && dp[1] == 'l' as u8 && dp[2] == 'o' as u8 && dp[3] == 'n' as u8 && dp[4] == 'g' as u8)
+      || (dlen == 5 && dp[1] == 'q' as u8 && dp[2] == 'u' as u8 && dp[3] == 'a' as u8 && dp[4] == 'd' as u8)) {
+    let sz: i32 = 0;
+    let rkind: i32 = 0;
+    if (dlen == 5 && dp[1] == 'b' as u8) { sz = 1; rkind = 0; }
+    else if (dlen == 6 && dp[1] == 'h' as u8) { sz = 2; rkind = R_ABS16; }
+    else if (dlen == 6 && dp[1] == 's' as u8) { sz = 2; rkind = R_ABS16; }
+    else if (dlen == 5 && dp[1] == 'w' as u8) { sz = 4; rkind = R_ABS32; }
+    else if (dlen == 5 && dp[1] == 'l' as u8) { sz = 4; rkind = R_ABS32; }
+    else { sz = 8; rkind = R_ABS64; }
+    emit_data_values(l, toks, nt, sz, rkind);
+    return;
+  }
+  // ---- strings
+  if ((dlen == 6 && dp[1] == 'a' as u8 && dp[2] == 's' as u8 && dp[3] == 'c' as u8 && dp[4] == 'i' as u8 && dp[5] == 'z' as u8)
+      || (dlen == 7 && dp[1] == 's' as u8 && dp[2] == 't' as u8 && dp[3] == 'r' as u8 && dp[4] == 'i' as u8 && dp[5] == 'n' as u8 && dp[6] == 'g' as u8)
+      || (dlen == 6 && dp[1] == 'a' as u8 && dp[2] == 's' as u8 && dp[3] == 'c' as u8 && dp[4] == 'i' as u8 && dp[5] == 'i' as u8)) {
+    let addnul: bool = (dlen == 6 && dp[5] == 'z' as u8) || (dlen == 7);
+    let k: i32 = 1;
+    while (k < nt) {
+      if (toks[k].kind == TKW_STR) {
+        let sb: Buf;
+        buf_init(&sb);
+        unescape(toks[k].p, toks[k].v, &sb);
+        if (addnul) { buf_putb(&sb, 0); }
+        let s: *Sect = sect_cur();
+        if (pass == 1) {
+          let i: i64 = 0;
+          while (i < sb.len) {
+            buf_putb(&s.d, 0);
+            i += 1;
+          }
+        } else {
+          rt_copy(s.d.data + s.d.len, sb.data, sb.len);
+          s.d.len += sb.len;
+        }
+      }
+      k += 1;
+    }
+    return;
+  }
+  // ---- zero / space / skip
+  if ((dlen == 5 && dp[1] == 'z' as u8 && dp[2] == 'e' as u8 && dp[3] == 'r' as u8 && dp[4] == 'o' as u8)
+      || (dlen == 6 && dp[1] == 's' as u8 && dp[2] == 'p' as u8 && dp[3] == 'a' as u8 && dp[4] == 'c' as u8 && dp[5] == 'e' as u8)
+      || (dlen == 5 && dp[1] == 's' as u8 && dp[2] == 'k' as u8 && dp[3] == 'i' as u8 && dp[4] == 'p' as u8)) {
+    if (nt >= 2) {
+      let p2: i32 = 1;
+      let ex: Expr;
+      ex.val = 0;
+      ex.sym = -1;
+      ex.xlate = 0;
+      parse_expr_at(toks, nt, &p2, &ex);
+      let n: i64 = expr_const(&ex, line, toks[1].col);
+      let fill: u8 = 0;
+      if (p2 < nt && toks[p2].kind == TKW_PUNCT && toks[p2].p[0] == ',' as u8 && p2 + 1 < nt) {
+        fill = toks[p2 + 1].v as u8;
+      }
+      let s: *Sect = sect_cur();
+      if (s.kind == 1) {
+        // .bss: just advance (virtual size)
+        if (pass == 1) { s.d.len += n; }
+        return;
+      }
+      if (pass == 1) {
+        let i: i64 = 0;
+        while (i < n) {
+          buf_putb(&s.d, fill);
+          i += 1;
+        }
+      } else {
+        if (fill != 0) {
+          let i: i64 = 0;
+          while (i < n) {
+            s.d.data[s.d.len + i] = fill;
+            i += 1;
+          }
+        }
+        s.d.len += n;
+      }
+    }
+    return;
+  }
+  // ---- ignored directives
+  if (dlen == 5 && dp[1] == 'f' as u8 && dp[2] == 'i' as u8 && dp[3] == 'l' as u8 && dp[4] == 'e' as u8) { return; }
+  if (dlen == 4 && dp[1] == 'l' as u8 && dp[2] == 'o' as u8 && dp[3] == 'c' as u8) { return; }
+  if (dlen == 5 && dp[1] == 'f' as u8 && dp[2] == 'u' as u8 && dp[3] == 'n' as u8 && dp[4] == 'c' as u8) { return; }
+
+  let m: *u8 = "unknown directive";
+  report(line, d.col, m);
+}
+
+fn set_binding(l: *LineRec, toks: *Tok, nt: i32, bind: i32) -> void {
+  let k: i32 = 1;
+  while (k < nt) {
+    if (toks[k].kind == TKW_IDENT) {
+      let nm: [128]u8;
+      sym_name_copy(&toks[k], nm, 128);
+      let si: i32 = sym_intern(nm);
+      let sr: *SymRec = (syms + si) as *SymRec;
+      sr.bind = bind;
+    }
+    k += 1;
+  }
+}
+
+// emit data values for .byte/.word/... shared across passes
+fn emit_data_values(l: *LineRec, toks: *Tok, nt: i32, sz: i32, rkind: i32) -> void {
+  let s: *Sect = sect_cur();
+  let k: i32 = 1;
+  while (k < nt) {
+    if (toks[k].kind == TKW_PUNCT && toks[k].p[0] == ',' as u8) {
+      k += 1;
+      continue;
+    }
+    let ex: Expr;
+    ex.val = 0;
+    ex.sym = -1;
+    ex.xlate = 0;
+    let p2: i32 = k;
+    parse_expr_at(toks, nt, &p2, &ex);
+    k = p2;
+    if (pass == 1) {
+      let i: i32 = 0;
+      while (i < sz) {
+        buf_putb(&s.d, 0);
+        i += 1;
+      }
+    } else {
+      let off: i64 = s.d.len;
+      if (ex.sym >= 0) {
+        add_rela(s.idx, off, ex.sym, rkind, ex.val);
+        // write zeros (value comes from the linker)
+        let i: i32 = 0;
+        while (i < sz) {
+          s.d.data[off + i] = 0;
+          i += 1;
+        }
+        s.d.len += sz;
+      } else {
+        let v: u64 = ex.val as u64;
+        let i: i32 = 0;
+        while (i < sz) {
+          s.d.data[off + i] = (v >> (8 * i)) as u8;
+          i += 1;
+        }
+        s.d.len += sz;
+      }
+    }
+  }
+}
+
+// --------------------------------------------------------------- encoding
+fn mneq(t: *Tok, s: *u8) -> bool {
+  if (t.kind != TKW_IDENT) { return false; }
+  if (t.v != rt_strlen(s)) { return false; }
+  let k: i64 = 0;
+  while (k < t.v) {
+    if (t.p[k] != s[k] as u8) { return false; }
+    k += 1;
+  }
+  return true;
+}
+
+// internal resolve policy: .L labels or LOCAL symbols in the same section
+fn internal_target(sym: i32, val: i64, sec: i32, roff: *i64) -> bool {
+  if (sym < 0) { return false; }
+  let s: *SymRec = (syms + sym) as *SymRec;
+  if (s.sec != sec) { return false; }
+  if (s.name[0] == '.' as u8) { roff[0] = s.off + val; return true; }
+  if (s.bind == STB_LOCAL) { roff[0] = s.off + val; return true; }
+  return false;
+}
+
+// encode a pc-relative branch (26-bit) with internal resolve or JUMP26/CALL26
+fn enc_branch(o: *Opnd, sec: i32, pc: i64, iscall: i32, line: i32, col: i32) -> u32 {
+  let target: i64 = 0;
+  let internal: bool = internal_target(o.e.sym, o.e.val, sec, &target);
+  if (!internal && o.e.sym >= 0) {
+    let kind: i32 = R_JUMP26;
+    if (iscall != 0) { kind = R_CALL26; }
+    add_rela(sec, pc, o.e.sym, kind, o.e.val);
+    return 0;
+  }
+  if (!internal) {
+    let m: *u8 = "branch to undefined symbol";
+    report(line, col, m);
+    return 0;
+  }
+  let delta: i64 = target - (pc + 4);
+  if (delta < -134217728 || delta > 134217727) {
+    let m: *u8 = "branch out of range";
+    report(line, col, m);
+    return 0;
+  }
+  let imm26: u32 = ((delta >> 2) as u64) & 0x3FFFFFF;
+  if (iscall != 0) { return 0x94000000 | imm26; }
+  return 0x14000000 | imm26;
+}
+
+fn cond_code(name: *u8, len: i64) -> i32 {
+  // eq ne cs hs cc lo mi pl vs vc hi ls ge lt gt le al nv
+  if (len == 2) {
+    if (name[0] == 'e' as u8 && name[1] == 'q' as u8) { return 0; }
+    if (name[0] == 'n' as u8 && name[1] == 'e' as u8) { return 1; }
+    if (name[0] == 'c' as u8 && name[1] == 's' as u8) { return 2; }
+    if (name[0] == 'h' as u8 && name[1] == 's' as u8) { return 2; }
+    if (name[0] == 'c' as u8 && name[1] == 'c' as u8) { return 3; }
+    if (name[0] == 'l' as u8 && name[1] == 'o' as u8) { return 3; }
+    if (name[0] == 'm' as u8 && name[1] == 'i' as u8) { return 4; }
+    if (name[0] == 'p' as u8 && name[1] == 'l' as u8) { return 5; }
+    if (name[0] == 'v' as u8 && name[1] == 's' as u8) { return 6; }
+    if (name[0] == 'v' as u8 && name[1] == 'c' as u8) { return 7; }
+    if (name[0] == 'h' as u8 && name[1] == 'i' as u8) { return 8; }
+    if (name[0] == 'l' as u8 && name[1] == 's' as u8) { return 9; }
+    if (name[0] == 'g' as u8 && name[1] == 'e' as u8) { return 10; }
+    if (name[0] == 'l' as u8 && name[1] == 't' as u8) { return 11; }
+    if (name[0] == 'g' as u8 && name[1] == 't' as u8) { return 12; }
+    if (name[0] == 'l' as u8 && name[1] == 'e' as u8) { return 13; }
+    if (name[0] == 'a' as u8 && name[1] == 'l' as u8) { return 14; }
+    if (name[0] == 'n' as u8 && name[1] == 'v' as u8) { return 15; }
+  }
+  return -1;
+}
+
+
+// --------------------------------------------------------------- encoders
+// Register field value: SP (32) encodes as 31 in Rn/Rd slots.
+fn regf(r: i32) -> i64 {
+  if (r == 32) { return 31; }
+  return r as i64;
+}
+
+// Require a register operand; w64: 1 = x regs, 0 = w regs, -1 = either.
+fn need_reg(o: *Opnd, w64: i32, line: i32) -> i32 {
+  if (o.kind != OP_REG) {
+    let m: *u8 = "expected register operand";
+    report(line, 1, m);
+    return -1;
+  }
+  if (w64 >= 0 && o.is64 != w64) {
+    let m2: *u8 = "register width mismatch";
+    report(line, 1, m2);
+    return -1;
+  }
+  return o.rnum;
+}
+
+// Try to read a trailing shift suffix: lsl|lsr|asr|ror [#imm].
+// Returns false when the token range does not start with one of those.
+fn suffix_shift(toks: *Tok, a: i32, b: i32, sh: *i32, amt: *i32, line: i32) -> bool {
+  if (a >= b) { return false; }
+  let t: *Tok = (toks + a) as *Tok;
+  if (t.kind != TKW_IDENT || t.v != 3) { return false; }
+  let sc: i32 = -1;
+  if (t.p[0] == 'l' as u8 && t.p[1] == 's' as u8 && t.p[2] == 'l' as u8) { sc = 0; }
+  else if (t.p[0] == 'l' as u8 && t.p[1] == 's' as u8 && t.p[2] == 'r' as u8) { sc = 1; }
+  else if (t.p[0] == 'a' as u8 && t.p[1] == 's' as u8 && t.p[2] == 'r' as u8) { sc = 2; }
+  else if (t.p[0] == 'r' as u8 && t.p[1] == 'o' as u8 && t.p[2] == 'r' as u8) { sc = 3; }
+  if (sc < 0) { return false; }
+  sh[0] = sc;
+  amt[0] = 0;
+  let i: i32 = a + 1;
+  if (i < b && toks[i].kind == TKW_PUNCT && toks[i].p[0] == '#' as u8) { i += 1; }
+  if (i < b && toks[i].kind == TKW_NUM) { amt[0] = toks[i].v as i32; i += 1; }
+  if (i != b) {
+    let m: *u8 = "junk after shift amount";
+    report(line, toks[i].col, m);
+  }
+  return true;
+}
+
+// Fold a :lo12: style operand: local same-section symbols fold to a
+// constant, everything else gets an R_ADD_ABS_LO12 relocation and a
+// zero field.  Pure constants are range checked (0..4095).
+fn lo12_field(sec: i32, off: i64, o: *Opnd, line: i32, col: i32) -> i64 {
+  if (o.e.sym >= 0) {
+    let ro: i64 = 0;
+    if (internal_target(o.e.sym, o.e.val, sec, &ro)) { return ro & 0xFFF; }
+    add_rela(sec, off, o.e.sym, R_ADD_ABS_LO12, o.e.val);
+    return 0;
+  }
+  if (o.imm < 0 || o.imm > 4095) {
+    let m: *u8 = "immediate out of range for 12-bit lo12 field";
+    report(line, col, m);
+    return 0;
+  }
+  return o.imm;
+}
+
+// pc-relative 19-bit field (imm19, in instructions) for cbz/b.cond:
+// internal fold, otherwise a relocation of kind rkind with zero field.
+fn pcrel19(o: *Opnd, sec: i32, pc: i64, rkind: i32, line: i32, col: i32) -> i64 {
+  if (o.e.sym >= 0) {
+    let ro: i64 = 0;
+    if (internal_target(o.e.sym, o.e.val, sec, &ro)) {
+      let d: i64 = ro - (pc + 4);
+      if (d < -1048576 || d > 1048572 || (d & 3) != 0) {
+        let m: *u8 = "conditional branch target out of range";
+        report(line, col, m);
+        return 0;
+      }
+      return ((d >> 2) & 0x7FFFF) << 5;
+    }
+    add_rela(sec, pc, o.e.sym, rkind, o.e.val);
+    return 0;
+  }
+  let d2: i64 = o.imm - (pc + 4);
+  if (d2 < -1048576 || d2 > 1048572 || (d2 & 3) != 0) {
+    let m2: *u8 = "branch target out of range";
+    report(line, col, m2);
+    return 0;
+  }
+  return ((d2 >> 2) & 0x7FFFF) << 5;
+}
+
+// pc-relative 14-bit field for tbz/tbnz.
+fn pcrel14(o: *Opnd, sec: i32, pc: i64, line: i32, col: i32) -> i64 {
+  if (o.e.sym >= 0) {
+    let ro: i64 = 0;
+    if (internal_target(o.e.sym, o.e.val, sec, &ro)) {
+      let d: i64 = ro - (pc + 4);
+      if (d < -32768 || d > 32764 || (d & 3) != 0) {
+        let m: *u8 = "tbz/tbnz target out of range";
+        report(line, col, m);
+        return 0;
+      }
+      return ((d >> 2) & 0x3FFF) << 5;
+    }
+    add_rela(sec, pc, o.e.sym, R_TSTBR14, o.e.val);
+    return 0;
+  }
+  let d2: i64 = o.imm - (pc + 4);
+  if (d2 < -32768 || d2 > 32764 || (d2 & 3) != 0) {
+    let m2: *u8 = "tbz/tbnz target out of range";
+    report(line, col, m2);
+    return 0;
+  }
+  return ((d2 >> 2) & 0x3FFF) << 5;
+}
+
+// adr / adrp: ADR resolves pc-relative byte delta; ADRP resolves a page
+// delta.  External symbols get the corresponding relocations.
+fn enc_adr(o: *Opnd, sec: i32, pc: i64, ispage: i32, line: i32, col: i32) -> i64 {
+  let delta: i64 = 0;
+  if (o.e.sym >= 0) {
+    let ro: i64 = 0;
+    if (internal_target(o.e.sym, o.e.val, sec, &ro)) {
+      if (ispage != 0) {
+        delta = ((ro & -4096) - (pc & -4096)) >> 12;
+      } else {
+        delta = ro - pc;
+      }
+    } else {
+      let kind: i32 = R_ADR_PREL_LO21;
+      if (ispage != 0) { kind = R_ADR_PREL_PG_HI21; }
+      add_rela(sec, pc, o.e.sym, kind, o.e.val);
+      return 0;
+    }
+  } else {
+    if (ispage != 0) {
+      delta = ((o.imm & -4096) - (pc & -4096)) >> 12;
+    } else {
+      delta = o.imm - pc;
+    }
+  }
+  if (delta < -1048576 || delta > 1048575) {
+    let m: *u8 = "adr/adrp out of range";
+    report(line, col, m);
+    return 0;
+  }
+  let immlo: i64 = delta & 3;
+  let immhi: i64 = (delta >> 2) & 0x7FFFF;
+  if (ispage != 0) { return 0x9F000000 | (immlo << 29) | (immhi << 5); }
+  return (immlo << 29) | (immhi << 5);
+}
+
+// integer log2 of a power of two (used for load/store scale)
+fn log2i(v: i64) -> i64 {
+  let r: i64 = 0;
+  while ((1 << (r + 1)) <= v) { r += 1; }
+  return r;
+}
+
+// The instruction encoder.  Pass 2 only; writes one word at the current
+// position of the current section and advances by 4.
+fn encode_instruction(l: *LineRec, toks: *Tok, nt: i32) -> void {
+  let s: *Sect = sect_cur();
+  let off: i64 = s.d.len as i64;
+  let line: i32 = l.line;
+  let starts: [8]i32;
+  let ends: [8]i32;
+  let nops: i32 = split_operands(toks, nt, 1, starts, ends, 8);
+  let m: *Tok = &toks[0];
+
+  // ---- zero-operand system instructions (operands ignored for barriers)
+  if (mneq(m, "nop")) { poke32(s.idx, off, 0xD503201F); s.d.len += 4; return; }
+  if (mneq(m, "isb")) { poke32(s.idx, off, 0xD5033FDF); s.d.len += 4; return; }
+  if (mneq(m, "dsb") || mneq(m, "dmb")) { poke32(s.idx, off, 0xD5033F9F); s.d.len += 4; return; }
+
+  // trailing shift suffix (add/sub/cmp family, movz family)?
+  let has_suf: bool = false;
+  let suf_sh: i32 = 0;
+  let suf_amt: i32 = 0;
+  if (nops >= 2) {
+    let s2: i32 = 0;
+    let a2: i32 = 0;
+    if (suffix_shift(toks, starts[nops - 1], ends[nops - 1], &s2, &a2, line)) {
+      has_suf = true;
+      suf_sh = s2;
+      suf_amt = a2;
+      nops -= 1;
+    }
+  }
+
+  // condition-code mnemonics keep their last operand unparsed (it is a
+  // condition name like eq, not a symbol)
+  let condmode: bool = false;
+  if (mneq(m, "cset") || mneq(m, "csetm") || mneq(m, "cinc") || mneq(m, "cinv")
+      || mneq(m, "cneg") || mneq(m, "csel") || mneq(m, "csinc") || mneq(m, "csinv")
+      || mneq(m, "csneg")) {
+    condmode = true;
+  }
+  let nparse: i32 = nops;
+  if (condmode) { nparse = nops - 1; }
+
+  let ops: [8]Opnd;
+  let k: i32 = 0;
+  while (k < nparse) {
+    parse_operand(toks, starts[k], ends[k], &ops[k], line);
+    k += 1;
+  }
+  let cc: i32 = -1;
+  if (condmode) {
+    let ca: i32 = starts[nops - 1];
+    let cb: i32 = ends[nops - 1];
+    if (cb - ca == 1 && toks[ca].kind == TKW_IDENT && toks[ca].v == 2) {
+      cc = cond_code(toks[ca].p, 2);
+    }
+    if (cc < 0) {
+      let em: *u8 = "bad condition code";
+      report(line, toks[ca].col, em);
+    }
+  }
+  let w: i64 = 0;
+
+  // ---- data processing: add/sub immediate or register ----------------
+  if (mneq(m, "add") || mneq(m, "adds") || mneq(m, "sub") || mneq(m, "subs")
+      || mneq(m, "cmp") || mneq(m, "cmn")) {
+    let issub: i32 = 0;
+    let isset: i32 = 0;
+    let iszr: i32 = 0;
+    if (m.p[0] == 's' as u8 && m.p[1] == 'u' as u8) { issub = 1; }
+    if (m.v >= 4) { isset = 1; }
+    if (m.p[0] == 'c' as u8) { iszr = 1; }
+    if (nops < 2 || (iszr == 0 && nops < 3)) {
+      let em: *u8 = "missing operands";
+      report(line, m.col, em);
+    } else {
+      let rn_i: i32 = 0;
+      let src_i: i32 = 1;
+      if (iszr == 0) { rn_i = 1; src_i = 2; }
+      let rn: i32 = need_reg(&ops[rn_i], -1, line);
+      let rd: i32 = 31;
+      if (iszr == 0) { rd = need_reg(&ops[0], -1, line); }
+      let want: i32 = ops[rn_i].is64;
+      if (rd >= 0 && rd != 31 && ops[0].is64 != want) {
+        let em2: *u8 = "register width mismatch";
+        report(line, m.col, em2);
+      }
+      // bases
+      let bimm: i64 = 0x91000000;
+      let breg: i64 = 0x8B000000;
+      if (want == 0) { bimm = 0x11000000; breg = 0x0B000000; }
+      if (isset != 0) {
+        if (issub != 0) { bimm = 0xF1000000; breg = 0xEB000000; }
+        else { bimm = 0xB1000000; breg = 0xAB000000; }
+        if (want == 0) { bimm = bimm - 0x80000000; breg = breg - 0x80000000; }
+      } else if (issub != 0) {
+        bimm = 0xD1000000; breg = 0xCB000000;
+        if (want == 0) { bimm = bimm - 0x80000000; breg = breg - 0x80000000; }
+      }
+      let src: *Opnd = &ops[src_i];
+      if (src.kind == OP_IMM) {
+        // immediate form: 12-bit, optional lsl #12
+        let shbit: i64 = 0;
+        if (has_suf) {
+          if (suf_sh != 0) {
+            let em3: *u8 = "only lsl #12 allowed on immediate";
+            report(line, m.col, em3);
+          } else if (suf_amt == 12) {
+            shbit = 1;
+          } else if (suf_amt != 0) {
+            let em4: *u8 = "bad immediate shift";
+            report(line, m.col, em4);
+          }
+        }
+        let imm: i64 = lo12_field(s.idx, off, src, line, m.col);
+        w = bimm | shbit << 22 | (imm & 0xFFF) << 10 | regf(rn) << 5 | regf(rd);
+      } else if (src.kind == OP_REG) {
+        let rm: i32 = need_reg(src, want, line);
+        if (has_suf) {
+          if (suf_sh == 3) {
+            let em5: *u8 = "ror not allowed for add/sub";
+            report(line, m.col, em5);
+          }
+          if (suf_amt < 0 || suf_amt > 63 || (want == 0 && suf_amt > 31)) {
+            let em6: *u8 = "shift amount out of range";
+            report(line, m.col, em6);
+          }
+        } else {
+          suf_sh = 0;
+          suf_amt = 0;
+        }
+        w = breg | (suf_sh as i64) << 22 | regf(rm) << 16 | (suf_amt as i64) << 10 | regf(rn) << 5 | regf(rd);
+      } else {
+        let em7: *u8 = "bad third operand";
+        report(line, m.col, em7);
+      }
+    }
+  }
+  // ---- logical register forms and their zero-operand aliases ---------
+  else if (mneq(m, "and") || mneq(m, "orr") || mneq(m, "eor") || mneq(m, "ands")
+      || mneq(m, "bic") || mneq(m, "orn") || mneq(m, "eon") || mneq(m, "bics")
+      || mneq(m, "tst") || mneq(m, "mvn") || mneq(m, "mov") || mneq(m, "neg")) {
+    // base by mnemonic and width (register shifted form)
+    let bx: i64 = 0x8A000000;
+    let bw: i64 = 0x0A000000;
+    if (mneq(m, "and")) { bx = 0x8A000000; bw = 0x0A000000; }
+    else if (mneq(m, "orr")) { bx = 0xAA000000; bw = 0x2A000000; }
+    else if (mneq(m, "eor")) { bx = 0xCA000000; bw = 0x4A000000; }
+    else if (mneq(m, "ands")) { bx = 0xEA000000; bw = 0x6A000000; }
+    else if (mneq(m, "bic")) { bx = 0x8A200000; bw = 0x0A200000; }
+    else if (mneq(m, "orn")) { bx = 0xAA200000; bw = 0x2A200000; }
+    else if (mneq(m, "eon")) { bx = 0xCA200000; bw = 0x4A200000; }
+    else if (mneq(m, "bics")) { bx = 0xEA200000; bw = 0x6A200000; }
+    let isz2: i32 = 0;   // tst / mvn / neg: two-operand forms
+    let zbase: i64 = 0;
+    if (mneq(m, "tst")) { isz2 = 1; zbase = 0xEA000000; }
+    else if (mneq(m, "mvn")) { isz2 = 1; zbase = 0xAA200000; }
+    else if (mneq(m, "neg")) { isz2 = 1; zbase = 0xCB000000; }
+    if (isz2 != 0) {
+      if (nops != 2) {
+        let em: *u8 = "expected two operands";
+        report(line, m.col, em);
+      } else {
+        let rn: i32 = need_reg(&ops[0], -1, line);
+        let rm: i32 = need_reg(&ops[1], ops[0].is64, line);
+        let bb: i64 = zbase;
+        if (ops[0].is64 == 0) { bb = zbase - 0x80000000; }
+        let shb2: i32 = 0;
+        let amt2: i32 = 0;
+        if (has_suf && mneq(m, "tst")) {
+          // tst accepts a shifted source like ands
+          shb2 = suf_sh;
+          amt2 = suf_amt;
+        }
+        w = bb | (shb2 as i64) << 22 | regf(rm) << 16 | (amt2 as i64) << 10 | regf(rn) << 5 | 31;
+      }
+    } else if (mneq(m, "mov")) {
+      if (nops != 2) {
+        let em2: *u8 = "mov takes two operands";
+        report(line, m.col, em2);
+      } else {
+        let a: *Opnd = &ops[0];
+        let b: *Opnd = &ops[1];
+        if (a.kind == OP_REG && b.kind == OP_REG) {
+          if (a.rnum == 32 || b.rnum == 32) {
+            // via add immediate zero
+            if (a.rnum == 32 && b.rnum == 32) {
+              let em3: *u8 = "cannot move sp to sp";
+              report(line, m.col, em3);
+            } else {
+              let is64: i32 = a.is64;
+              if (b.rnum == 32) { is64 = b.is64; }
+              if (is64 == 0) {
+                let em4: *u8 = "sp must use x registers";
+                report(line, m.col, em4);
+              }
+              let bb2: i64 = 0x91000000;
+              if (is64 == 0) { bb2 = 0x11000000; }
+              w = bb2 | regf(b.rnum) << 5 | regf(a.rnum);
+            }
+          } else {
+            if (a.is64 != b.is64) {
+              let em5: *u8 = "register width mismatch";
+              report(line, m.col, em5);
+            }
+            let bb3: i64 = 0xAA000000;
+            if (a.is64 == 0) { bb3 = 0x2A000000; }
+            w = bb3 | regf(b.rnum) << 16 | 31 << 5 | regf(a.rnum);
+          }
+        } else if (a.kind == OP_REG && b.kind == OP_IMM) {
+          // mov Rd, #imm alias: movz / movn forms
+          let imm: i64 = b.imm;
+          let is64b: i32 = a.is64;
+          let hb: i32 = 0;
+          if (has_suf) {
+            if (suf_sh != 0 || (suf_amt % 16) != 0) {
+              let em6: *u8 = "only lsl #16*n allowed";
+              report(line, m.col, em6);
+            }
+            hb = suf_amt / 16;
+          }
+          if (imm >= 0 && imm <= 65535) {
+            let bb4: i64 = 0xD2800000;
+            if (is64b == 0) { bb4 = 0x52800000; }
+            w = bb4 | (hb as i64) << 21 | imm << 5 | regf(a.rnum);
+          } else if (imm < 0 && (-imm - 1) <= 65535) {
+            let bb5: i64 = 0x92800000;
+            if (is64b == 0) { bb5 = 0x12800000; }
+            w = bb5 | (hb as i64) << 21 | (-imm - 1) << 5 | regf(a.rnum);
+          } else {
+            let em7: *u8 = "cannot encode mov immediate (use movz/movk)";
+            report(line, m.col, em7);
+          }
+        } else {
+          let em8: *u8 = "bad mov operands";
+          report(line, m.col, em8);
+        }
+      }
+    } else {
+      // three-operand logical: and Rd, Rn, Rm {, shift}
+      if (nops != 3) {
+        let em9: *u8 = "expected three operands";
+        report(line, m.col, em9);
+      } else {
+        let rd: i32 = need_reg(&ops[0], -1, line);
+        let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+        let rm: i32 = need_reg(&ops[2], ops[0].is64, line);
+        let bb6: i64 = bx;
+        if (ops[0].is64 == 0) { bb6 = bw; }
+        let shb: i32 = 0;
+        let amt: i32 = 0;
+        if (has_suf) {
+          if (suf_amt < 0 || suf_amt > 63 || (ops[0].is64 == 0 && suf_amt > 31)) {
+            let ema: *u8 = "shift amount out of range";
+            report(line, m.col, ema);
+          }
+          shb = suf_sh;
+          amt = suf_amt;
+        }
+        w = bb6 | (shb as i64) << 22 | regf(rm) << 16 | (amt as i64) << 10 | regf(rn) << 5 | regf(rd);
+      }
+    }
+  }
+  // ---- movz / movk / movn --------------------------------------------
+  else if (mneq(m, "movz") || mneq(m, "movk") || mneq(m, "movn")) {
+    if (nops != 2) {
+      let em: *u8 = "movz/movk/movn take two operands";
+      report(line, m.col, em);
+    } else {
+      let rd: i32 = need_reg(&ops[0], -1, line);
+      let is64: i32 = ops[0].is64;
+      let imm: i64 = ops[1].imm;
+      let hw: i32 = 0;
+      if (has_suf) {
+        if (suf_sh != 0 || (suf_amt % 16) != 0) {
+          let em2: *u8 = "only lsl #16*n allowed";
+          report(line, m.col, em2);
+        }
+        hw = suf_amt / 16;
+      }
+      if (imm < 0 || imm > 65535) {
+        let em3: *u8 = "16-bit immediate out of range";
+        report(line, m.col, em3);
+      }
+      if (is64 == 0 && hw > 1) {
+        let em4: *u8 = "lsl amount out of range for w register";
+        report(line, m.col, em4);
+      }
+      let base: i64 = 0xD2800000;
+      if (is64 == 0) { base = 0x52800000; }
+      if (m.p[3] == 'k' as u8) {
+        base = 0xF2800000;
+        if (is64 == 0) { base = 0x72800000; }
+      } else if (m.p[3] == 'n' as u8) {
+        base = 0x92800000;
+        if (is64 == 0) { base = 0x12800000; }
+      }
+      w = base | (hw as i64) << 21 | imm << 5 | regf(rd);
+    }
+  }
+  // ---- register shifts / divides (same encoding group) ---------------
+  else if (mneq(m, "lsl") || mneq(m, "lsr") || mneq(m, "asr") || mneq(m, "ror")
+      || mneq(m, "sdiv") || mneq(m, "udiv")) {
+    if (mneq(m, "sdiv") || mneq(m, "udiv")) {
+      if (nops != 3) {
+        let em: *u8 = "expected three operands";
+        report(line, m.col, em);
+      } else {
+        let rd: i32 = need_reg(&ops[0], -1, line);
+        let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+        let rm: i32 = need_reg(&ops[2], ops[0].is64, line);
+        let bb: i64 = 0x9AC00000;
+        if (ops[0].is64 == 0) { bb = 0x1AC00000; }
+        let opn: i64 = 3;
+        if (m.p[0] == 'u' as u8) { opn = 2; }
+        w = bb | regf(rm) << 16 | opn << 10 | regf(rn) << 5 | regf(rd);
+      }
+    } else if (nops == 3 && ops[2].kind == OP_REG) {
+      // register shift: lslv/lsrv/asrv/rorv
+      let rd: i32 = need_reg(&ops[0], -1, line);
+      let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+      let rm: i32 = need_reg(&ops[2], ops[0].is64, line);
+      let mi: i32 = 0;
+      if (m.p[0] == 'l' as u8 && m.p[2] == 'r' as u8) { mi = 1; }
+      else if (m.p[0] == 'a' as u8) { mi = 2; }
+      else if (m.p[0] == 'r' as u8) { mi = 3; }
+      let bb2: i64 = 0x9AC00000;
+      if (ops[0].is64 == 0) { bb2 = 0x1AC00000; }
+      w = bb2 | regf(rm) << 16 | ((8 + mi) as i64) << 10 | regf(rn) << 5 | regf(rd);
+    } else if (nops == 3 && ops[2].kind == OP_IMM && !mneq(m, "ror")) {
+      // immediate shift: ubfm/sbfm aliases
+      let rd: i32 = need_reg(&ops[0], -1, line);
+      let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+      let esz: i64 = 64;
+      if (ops[0].is64 == 0) { esz = 32; }
+      let n: i64 = ops[2].imm;
+      if (n < 0 || n >= esz) {
+        let em2: *u8 = "shift amount out of range";
+        report(line, m.col, em2);
+      }
+      let immr: i64 = n;
+      let imms: i64 = esz - 1;
+      if (m.p[0] == 'l' as u8 && m.p[2] == 'l' as u8) {
+        // lsl: rotate left: immr = esz - n (mod esz), imms = esz-1-n
+        immr = (esz - n) % esz;
+        imms = esz - 1 - n;
+      }
+      let base: i64 = 0xD3400000;
+      if (ops[0].is64 == 0) { base = 0x53000000; }
+      if (m.p[0] == 'a' as u8) {
+        base = 0x93400000;
+        if (ops[0].is64 == 0) { base = 0x13000000; }
+      }
+      w = base | immr << 16 | imms << 10 | regf(rn) << 5 | regf(rd);
+    } else {
+      let em3: *u8 = "bad shift operands";
+      report(line, m.col, em3);
+    }
+  }
+  // ---- multiply / accumulate ------------------------------------------
+  else if (mneq(m, "madd") || mneq(m, "msub") || mneq(m, "mul") || mneq(m, "mneg")) {
+    let ism: i32 = 0;
+    if (m.p[1] == 's' as u8) { ism = 1; }
+    if (nops != 3 && nops != 4) {
+      let em: *u8 = "expected three or four operands";
+      report(line, m.col, em);
+    } else {
+      let rd: i32 = need_reg(&ops[0], -1, line);
+      let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+      let rm: i32 = need_reg(&ops[2], ops[0].is64, line);
+      let ra: i32 = 31;
+      if (nops == 4) { ra = need_reg(&ops[3], ops[0].is64, line); }
+      let bb: i64 = 0x9B000000;
+      if (ops[0].is64 == 0) { bb = 0x1B000000; }
+      w = bb | (ism as i64) << 21 | regf(rm) << 16 | regf(ra) << 10 | regf(rn) << 5 | regf(rd);
+    }
+  }
+  // ---- bitfield move / extract ----------------------------------------
+  else if (mneq(m, "sbfm") || mneq(m, "ubfm") || mneq(m, "bfm")) {
+    if (nops != 4) {
+      let em: *u8 = "expected four operands";
+      report(line, m.col, em);
+    } else {
+      let rd: i32 = need_reg(&ops[0], -1, line);
+      let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+      let esz: i64 = 64;
+      if (ops[0].is64 == 0) { esz = 32; }
+      let r: i64 = ops[2].imm;
+      let sc: i64 = ops[3].imm;
+      if (r < 0 || r >= esz || sc < 0 || sc >= esz) {
+        let em2: *u8 = "bitfield index out of range";
+        report(line, m.col, em2);
+      }
+      let base: i64 = 0x93400000;
+      if (m.p[0] == 'u' as u8) { base = 0xD3400000; }
+      else if (m.p[0] == 'b' as u8) { base = 0xB3400000; }
+      if (ops[0].is64 == 0) { base = base - 0x80000000; }
+      w = base | r << 16 | sc << 10 | regf(rn) << 5 | regf(rd);
+    }
+  }
+  // ---- extend aliases ---------------------------------------------------
+  else if (mneq(m, "sxtb") || mneq(m, "sxth") || mneq(m, "sxtw")
+      || mneq(m, "uxtb") || mneq(m, "uxth") || mneq(m, "uxtw")) {
+    if (nops != 2) {
+      let em: *u8 = "expected two operands";
+      report(line, m.col, em);
+    } else {
+      let rd: i32 = need_reg(&ops[0], -1, line);
+      let rn: i32 = need_reg(&ops[1], 0, line);
+      let dx: i32 = ops[0].is64;
+      let isu: i32 = 0;
+      let bits: i64 = 7;
+      if (m.p[1] == 'x' as u8) {
+        if (m.p[3] == 't' as u8) { bits = 15; } else { bits = 31; }  // sxth/uxth vs sxtw/uxtw
+      }
+      if (m.p[0] == 'u' as u8) { isu = 1; }
+      // width rules: sxtb/sxth: x or w dest; sxtw: x only; uxtb/uxth: w only; uxtw: x only
+      if (m.p[3] == 'w' as u8) {
+        if ((m.p[0] == 's' as u8) != (dx != 0)) {
+          let em2: *u8 = "bad destination width for extend";
+          report(line, m.col, em2);
+        }
+      } else {
+        if (isu != 0 && dx != 0) {
+          let em3: *u8 = "unsigned extend needs w destination";
+          report(line, m.col, em3);
+        }
+      }
+      let base: i64 = 0x93400000;
+      if (isu != 0) { base = 0xD3400000; }
+      if (dx == 0) { base = base - 0x80000000; }
+      w = base | bits << 10 | regf(rn) << 5 | regf(rd);
+    }
+  }
+  // ---- loads and stores --------------------------------------------------
+  else if (mneq(m, "str") || mneq(m, "ldr") || mneq(m, "strb") || mneq(m, "ldrb")
+      || mneq(m, "strh") || mneq(m, "ldrh") || mneq(m, "ldrsb") || mneq(m, "ldrsh")
+      || mneq(m, "ldrsw")) {
+    // merge split post-index operand
+    if (nops == 3 && ops[1].kind == OP_MEM && ops[1].memmode == 0 && ops[2].kind == OP_IMM) {
+      ops[1].memmode = 2;
+      ops[1].imm = ops[2].imm;
+      ops[1].e.val = ops[2].e.val; ops[1].e.sym = ops[2].e.sym; ops[1].e.xlate = ops[2].e.xlate;
+      nops = 2;
+    }
+    if (nops != 2 || ops[1].kind != OP_MEM) {
+      let em: *u8 = "expected register and memory operand";
+      report(line, m.col, em);
+    } else {
+      let rt: i32 = need_reg(&ops[0], -1, line);
+      let o: *Opnd = &ops[1];
+      let isstr: i32 = 0;
+      if (m.p[0] == 's' as u8) { isstr = 1; }
+      let size: i32 = 0;
+      let opc: i32 = 0;
+      let scale: i64 = 1;
+      if (m.v == 3) {
+        // str/ldr: size from Rt width
+        size = 2;
+        if (ops[0].is64 != 0) { size = 3; }
+        scale = 4;
+        if (ops[0].is64 != 0) { scale = 8; }
+        if (isstr == 0) { opc = 1; }
+      } else if (m.v == 4) {
+        // strb/ldrb/strh/ldrh
+        if (m.p[3] == 'b' as u8) {
+          size = 0; scale = 1;
+        } else {
+          size = 1; scale = 2;
+        }
+        if (ops[0].is64 != 0) {
+          let em2: *u8 = "byte/half access needs w register";
+          report(line, m.col, em2);
+        }
+        if (isstr == 0) { opc = 1; }
+      } else {
+        // ldrsb/ldrsh/ldrsw (5 chars)
+        if (m.p[3] == 's' as u8 && m.p[4] == 'b' as u8) {
+          size = 0; scale = 1;
+          opc = 2;
+          if (ops[0].is64 == 0) { opc = 3; }
+        } else if (m.p[4] == 'h' as u8) {
+          size = 1; scale = 2;
+          opc = 2;
+          if (ops[0].is64 == 0) { opc = 3; }
+        } else {
+          // ldrsw: x destination only
+          size = 2; scale = 4; opc = 2;
+          if (ops[0].is64 == 0) {
+            let em3: *u8 = "ldrsw needs x destination";
+            report(line, m.col, em3);
+          }
+        }
+      }
+      let head: i64 = (size as i64) << 30 | 7 << 27 | (opc as i64) << 22;
+      if (o.memmode == 0 && o.offreg < 0) {
+        // unsigned offset form
+        let field: i64 = 0;
+        if (o.e.sym >= 0) {
+          let ro: i64 = 0;
+          if (internal_target(o.e.sym, o.e.val, s.idx, &ro)) {
+            if ((ro & (scale - 1)) != 0) {
+              let em4: *u8 = "unaligned lo12 offset";
+              report(line, m.col, em4);
+            }
+            field = (ro & 0xFFF) >> log2i(scale);
+          } else {
+            let rk: i32 = R_LDST8_ABS_LO12;
+            if (scale == 8) { rk = R_LDST64_ABS_LO12; }
+            else if (scale == 4) { rk = R_LDST32_ABS_LO12; }
+            else if (scale == 2) { rk = R_LDST16_ABS_LO12; }
+            add_rela(s.idx, off, o.e.sym, rk, o.e.val);
+          }
+        } else {
+          let imm: i64 = o.imm;
+          if (imm < 0 || (imm % scale) != 0 || imm / scale > 4095) {
+            let em5: *u8 = "offset out of range (0..4095 scaled)";
+            report(line, m.col, em5);
+          }
+          field = imm / scale;
+        }
+        w = head | 1 << 24 | field << 10 | regf(o.base) << 5 | regf(rt);
+      } else if (o.memmode == 0 && o.offreg >= 0) {
+        // register offset form
+        let opt: i64 = 3;
+        if (o.offs64 == 0) { opt = 2; }
+        let sb: i64 = 0;
+        if (o.offscale != 0) {
+          if (o.offscale != scale) {
+            let em6: *u8 = "bad lsl amount for access size";
+            report(line, m.col, em6);
+          }
+          sb = 1;
+        }
+        w = head | 1 << 21 | opt << 13 | sb << 12 | 2 << 10 | regf(o.offreg) << 16 | regf(o.base) << 5 | regf(rt);
+      } else if (o.memmode == 1) {
+        // pre-index
+        let imm: i64 = o.imm;
+        if (imm < -256 || imm > 255) {
+          let em7: *u8 = "pre-index offset out of range (-256..255)";
+          report(line, m.col, em7);
+        }
+        w = head | 0xC00 | (imm & 0x1FF) << 12 | regf(o.base) << 5 | regf(rt);
+      } else {
+        // post-index
+        let imm2: i64 = o.imm;
+        if (imm2 < -256 || imm2 > 255) {
+          let em8: *u8 = "post-index offset out of range (-256..255)";
+          report(line, m.col, em8);
+        }
+        w = head | 0x400 | (imm2 & 0x1FF) << 12 | regf(o.base) << 5 | regf(rt);
+      }
+    }
+  }
+  // ---- load/store pair -----------------------------------------------------
+  else if (mneq(m, "stp") || mneq(m, "ldp")) {
+    if (nops == 4 && ops[2].kind == OP_MEM && ops[2].memmode == 0 && ops[3].kind == OP_IMM) {
+      ops[2].memmode = 2;
+      ops[2].imm = ops[3].imm;
+      ops[2].e.val = ops[3].e.val; ops[2].e.sym = ops[3].e.sym; ops[2].e.xlate = ops[3].e.xlate;
+      nops = 3;
+    }
+    if (nops != 3 || ops[2].kind != OP_MEM) {
+      let em: *u8 = "expected two registers and a memory operand";
+      report(line, m.col, em);
+    } else {
+      let rt1: i32 = need_reg(&ops[0], -1, line);
+      let rt2: i32 = need_reg(&ops[1], ops[0].is64, line);
+      let o: *Opnd = &ops[2];
+      let is64: i32 = ops[0].is64;
+      let opc: i64 = 0;
+      if (is64 != 0) { opc = 2; }
+      let lb: i64 = 0;
+      if (m.p[0] == 'l' as u8) { lb = 1 << 22; }
+      let mode: i64 = 2;
+      if (o.memmode == 1) { mode = 3; }
+      else if (o.memmode == 2) { mode = 1; }
+      let scale: i64 = 4;
+      if (is64 != 0) { scale = 8; }
+      let imm: i64 = o.imm;
+      if (o.e.sym >= 0) {
+        let em2: *u8 = "symbolic offsets not supported for stp/ldp";
+        report(line, m.col, em2);
+      }
+      if ((imm % scale) != 0 || imm / scale < -64 || imm / scale > 63) {
+        let em3: *u8 = "pair offset out of range";
+        report(line, m.col, em3);
+      }
+      w = opc << 30 | 5 << 27 | mode << 23 | lb | (imm / scale & 0x7F) << 15 | regf(rt2) << 10 | regf(o.base) << 5 | regf(rt1);
+    }
+  }
+  // ---- branches --------------------------------------------------------------
+  else if (mneq(m, "b") || mneq(m, "bl")) {
+    if (nops != 1) {
+      let em: *u8 = "branch takes one operand";
+      report(line, m.col, em);
+    } else {
+      let iscall: i32 = 0;
+      if (m.p[1] == 'l' as u8) { iscall = 1; }
+      w = enc_branch(&ops[0], s.idx, off, iscall, line, m.col) as i64;
+    }
+  }
+  else if (mneq(m, "cbz") || mneq(m, "cbnz")) {
+    if (nops != 2) {
+      let em: *u8 = "cbz/cbnz take two operands";
+      report(line, m.col, em);
+    } else {
+      let rt: i32 = need_reg(&ops[0], -1, line);
+      let base: i64 = 0x34000000;
+      if (ops[0].is64 != 0) { base = 0xB4000000; }
+      if (m.p[2] == 'n' as u8) { base = base + 0x01000000; }
+      w = base | pcrel19(&ops[1], s.idx, off, R_CONDBR19, line, m.col) | regf(rt);
+    }
+  }
+  else if (mneq(m, "tbz") || mneq(m, "tbnz")) {
+    if (nops != 3) {
+      let em: *u8 = "tbz/tbnz take three operands";
+      report(line, m.col, em);
+    } else {
+      let rt: i32 = need_reg(&ops[0], -1, line);
+      let bit: i64 = ops[1].imm;
+      if (bit < 0 || bit > 63 || (ops[0].is64 == 0 && bit > 31)) {
+        let em2: *u8 = "bit number out of range";
+        report(line, m.col, em2);
+      }
+      let base: i64 = 0x36000000;
+      if (m.p[2] == 'n' as u8) { base = base + 0x01000000; }
+      if (bit >= 32) { base = base + 0x80000000; }
+      w = base | (bit & 31) << 19 | pcrel14(&ops[2], s.idx, off, line, m.col) | regf(rt);
+    }
+  }
+  // ---- adr / adrp ---------------------------------------------------------
+  else if (mneq(m, "adr") || mneq(m, "adrp")) {
+    if (nops != 2) {
+      let em: *u8 = "adr/adrp take two operands";
+      report(line, m.col, em);
+    } else {
+      let rd: i32 = need_reg(&ops[0], 1, line);
+      let ispage: i32 = 0;
+      if (m.v == 4) { ispage = 1; }
+      w = enc_adr(&ops[1], s.idx, off, ispage, line, m.col) | regf(rd);
+    }
+  }
+  // ---- conditional select ---------------------------------------------------
+  else if (condmode) {
+    if (nops < 2) {
+      let em: *u8 = "missing operands";
+      report(line, m.col, em);
+    } else {
+      // base by mnemonic
+      let bx: i64 = 0x9A800000;
+      let bw: i64 = 0x1A800000;
+      let is2: i32 = 0;   // two-operand forms (cset, csetm)
+      let isinc: i32 = 0; // cinc/cinv/cneg: Rm = Rn
+      if (mneq(m, "cset")) { is2 = 1; bx = 0x9A800400; bw = 0x1A800400; }
+      else if (mneq(m, "csetm")) { is2 = 1; bx = 0xDA800000; bw = 0x5A800000; }
+      else if (mneq(m, "cinc")) { isinc = 1; bx = 0x9A800400; bw = 0x1A800400; }
+      else if (mneq(m, "cinv")) { isinc = 1; bx = 0xDA800000; bw = 0x5A800000; }
+      else if (mneq(m, "cneg")) { isinc = 1; bx = 0xDA800400; bw = 0x5A800400; }
+      else if (mneq(m, "csel")) { }
+      else if (mneq(m, "csinc")) { bx = 0x9A800400; bw = 0x1A800400; }
+      else if (mneq(m, "csinv")) { bx = 0xDA800000; bw = 0x5A800000; }
+      else if (mneq(m, "csneg")) { bx = 0xDA800400; bw = 0x5A800400; }
+      if (is2 != 0) {
+        // cset / csetm: Rd, cond
+        if (nparse != 1) {
+          let em9: *u8 = "cset/csetm take a register and a condition";
+          report(line, m.col, em9);
+        } else {
+          let rd: i32 = need_reg(&ops[0], -1, line);
+          let bb: i64 = bx;
+          if (ops[0].is64 == 0) { bb = bw; }
+          w = bb | 31 << 16 | (cc ^ 1) as i64 << 12 | 31 << 5 | regf(rd);
+        }
+      } else if (nparse == 3) {
+        // csel/csinc/csinv/csneg: Rd, Rn, Rm, cond
+        let rd: i32 = need_reg(&ops[0], -1, line);
+        let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+        let rm: i32 = need_reg(&ops[2], ops[0].is64, line);
+        let bb2: i64 = bx;
+        if (ops[0].is64 == 0) { bb2 = bw; }
+        w = bb2 | regf(rm) << 16 | (cc as i64) << 12 | regf(rn) << 5 | regf(rd);
+      } else if (nparse == 2 && isinc != 0) {
+        // cinc/cinv/cneg: Rd, Rn, cond  ->  CSxxx Rd, Rn, Rn, !cond
+        let rd: i32 = need_reg(&ops[0], -1, line);
+        let rn: i32 = need_reg(&ops[1], ops[0].is64, line);
+        let bb3: i64 = bx;
+        if (ops[0].is64 == 0) { bb3 = bw; }
+        w = bb3 | regf(rn) << 16 | (cc ^ 1) as i64 << 12 | regf(rn) << 5 | regf(rd);
+      } else {
+        let em2: *u8 = "bad conditional-select operands";
+        report(line, m.col, em2);
+      }
+    }
+  }
+  // ---- system -----------------------------------------------------------------
+  else if (mneq(m, "ret")) {
+    if (nops == 0) {
+      w = 0xD65F03C0;
+    } else {
+      let rn: i32 = need_reg(&ops[0], 1, line);
+      w = 0xD65F0000 | regf(rn) << 5;
+    }
+  }
+  else if (mneq(m, "br") || mneq(m, "blr")) {
+    if (nops != 1) {
+      let em: *u8 = "br/blr take one register";
+      report(line, m.col, em);
+    } else {
+      let rn: i32 = need_reg(&ops[0], 1, line);
+      let base: i64 = 0xD61F0000;
+      if (m.p[2] == 'r' as u8) { base = 0xD63F0000; }
+      w = base | regf(rn) << 5;
+    }
+  }
+  else if (mneq(m, "svc")) {
+    if (nops != 1) {
+      let em: *u8 = "svc takes one immediate";
+      report(line, m.col, em);
+    } else {
+      let imm: i64 = ops[0].imm;
+      if (imm < 0 || imm > 65535) {
+        let em2: *u8 = "svc immediate out of range";
+        report(line, m.col, em2);
+      }
+      w = 0xD4000001 | imm << 5;
+    }
+  }
+  else {
+    let em: *u8 = "unknown mnemonic";
+    report(line, m.col, em);
+  }
+
+  if (w < 0 || w > 0xFFFFFFFF) { w = 0; }
+  poke32(s.idx, off, w as u32);
+  s.d.len += 4;
+}
