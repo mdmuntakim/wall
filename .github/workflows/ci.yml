@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TARGET: aarch64-unknown-linux-gnu
-      SYSROOT: /usr/aarch64-linux-gnu
+      CFLAGS_EXTRA: -fuse-ld=lld
       TEST_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
 
     steps:
@@ -25,8 +25,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
-            qemu-user-static dpkg-dev
+            clang llvm lld gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            qemu-user dpkg-dev
 
       - name: Build
         run: make
@@ -36,6 +36,12 @@ jobs:
 
       - name: Package
         run: make package
+
+      - name: Verify package architecture and members
+        run: |
+          dpkg-deb -I wall_*.deb | grep -q "Architecture: aarch64"
+          test "$(ar t wall_*.deb | grep -c '\.tar\.xz')" -eq 2
+          ar t wall_*.deb
 
       - name: Upload package
         uses: actions/upload-artifact@v4

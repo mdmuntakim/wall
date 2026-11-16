@@ -7,7 +7,7 @@
 # Environment:
 #   TARGET       clang target triple (default: aarch64-unknown-linux-android24)
 #   PREFIX       installation prefix (default: Termux $PREFIX or /usr/local)
-#   ARCH         Debian architecture (default: dpkg --print-architecture)
+#   ARCH         package architecture (default: aarch64, "arm64" is normalized)
 #   SYSROOT      optional cross-compilation sysroot
 #   CFLAGS_EXTRA additional compiler flags
 #
@@ -21,7 +21,15 @@ cd "$ROOT"
 TARGET="${TARGET:-aarch64-unknown-linux-android24}"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 VERSION="$(cat VERSION)"
-ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
+# Package architecture.  The toolchain binaries are always built for AArch64,
+# so the package must declare the architecture name the *target* dpkg knows.
+# Termux identifies AArch64 as "aarch64" (Debian calls it "arm64"); defaulting
+# to "aarch64" and normalizing "arm64" keeps the package installable with
+#   dpkg -i  on Termux and any AArch64 system reporting "aarch64".
+ARCH="${ARCH:-aarch64}"
+case "$ARCH" in
+  arm64) ARCH="aarch64" ;;
+esac
 SYSROOT="${SYSROOT:-}"
 CFLAGS_EXTRA="${CFLAGS_EXTRA:-}"
 BUILD_DIR="$ROOT/.wallbuild"
@@ -48,7 +56,7 @@ SOURCES=(
 )
 HASH="$(cat "${SOURCES[@]}" | sha256sum | cut -c1-16)"
 COMMENT="wall version $VERSION ($HASH)"
-DEFINE="-DWALL_DEFAULT_COMMENT=\"$COMMENT\""
+DEFINE=(-DWALL_DEFAULT_COMMENT="\"$COMMENT\"" -DWALL_DEFAULT_TARGET="\"$TARGET\"")
 CFLAGS="--target=$TARGET -O2 -g0 -fno-ident -fno-asynchronous-unwind-tables $CFLAGS_EXTRA"
 INCLUDES="-I include -I src/common -I src/linker"
 
@@ -58,13 +66,13 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 echo "==> Building merged runtime library (libwall.so)..."
-clang $CFLAGS "$DEFINE" -DWALL_MULTICALL -shared -fPIC $INCLUDES \
+clang $CFLAGS "${DEFINE[@]}" -DWALL_MULTICALL -shared -fPIC $INCLUDES \
     src/compiler/libwall.c src/assembler/obasm.c src/linker/linker.c \
     src/common/wall_cli.c \
     -Wl,-soname,libwall.so -o libwall.so
 
 echo "==> Building Wall driver (wall)..."
-clang $CFLAGS "$DEFINE" $INCLUDES src/driver/wall.c -ldl -o wall
+clang $CFLAGS "${DEFINE[@]}" $INCLUDES src/driver/wall.c -ldl -o wall
 
 echo "==> Creating compatibility links..."
 ln -sf wall wallc
@@ -74,10 +82,15 @@ ln -sf wall ld.wall
 
 # Own the .comment sections.  A running executable cannot be opened for
 # writing (ETXTBSY), so the stamp tool is a separate build-time artifact.
+# When cross-building, TEST_RUNNER (e.g. "qemu-aarch64 -L <sysroot>") runs it.
 echo "==> Writing Wall .comment sections..."
-clang $CFLAGS "$DEFINE" $INCLUDES src/linker/linker.c src/common/wall_cli.c \
+clang $CFLAGS "${DEFINE[@]}" $INCLUDES src/linker/linker.c src/common/wall_cli.c \
     -o "$BUILD_DIR/stamp"
-"$BUILD_DIR/stamp" --stamp-comment="$COMMENT" wall libwall.so
+RUNNER=()
+if [ -n "${TEST_RUNNER:-}" ]; then
+  read -r -a RUNNER <<< "$TEST_RUNNER"
+fi
+"${RUNNER[@]}" "$BUILD_DIR/stamp" --stamp-comment="$COMMENT" wall libwall.so
 rm -f "$BUILD_DIR/stamp"
 
 install_tree() {
@@ -124,9 +137,13 @@ case "${1:-build}" in
     chmod 0644 "$DEBROOT/DEBIAN/md5sums"
 
     DEB="wall_${VERSION}_${ARCH}.deb"
-    dpkg-deb --build --root-owner-group "$DEBROOT" "$DEB" >/dev/null
+    # -Zxz: store the control and data members as .tar.xz (deterministic and
+    # readable by dpkg builds that default to gzip or zstd).
+    dpkg-deb --build --root-owner-group -Zxz "$DEBROOT" "$DEB" >/dev/null
     echo "Created $DEB"
     dpkg-deb -I "$DEB"
+    echo "==> Archive members:"
+    ar t "$DEB"
     ;;
   clean)
     rm -rf "$BUILD_DIR" libwall.so wall wallc obasm linker ld.wall

@@ -5,7 +5,8 @@
 
 SHELL := /bin/bash
 VERSION := $(shell cat VERSION)
-ARCH := $(shell dpkg --print-architecture 2>/dev/null || uname -m)
+# Match scripts/build.sh: Termux names AArch64 "aarch64", Debian "arm64".
+ARCH := $(shell a=$$(dpkg --print-architecture 2>/dev/null || uname -m); if [ "$$a" = arm64 ]; then a=aarch64; fi; echo $$a)
 
 .PHONY: all build install package test check clean distclean format help
 
@@ -30,7 +31,7 @@ clean:
 	@rm -rf tests/tmp
 
 distclean: clean
-	@rm -f wall_$(VERSION)_$(ARCH).deb wall-*.tar.xz
+	@rm -f wall_*.deb wall-*.tar.xz
 
 format:
 	@command -v clang-format >/dev/null || { echo "clang-format not found" >&2; exit 1; }

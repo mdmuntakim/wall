@@ -25,6 +25,13 @@
 #define WALL_DEFAULT_COMMENT "wall version 1.0.0"
 #endif
 
+/* Baked-in default target triple (set by scripts/build.sh from $TARGET).
+ * Without it obasm/clang fall back to the host default, which breaks
+ * cross-environments where the host is not the build target. */
+#ifndef WALL_DEFAULT_TARGET
+#define WALL_DEFAULT_TARGET ""
+#endif
+
 #define MAX_FLAGS 96
 #define MAX_DEFSYMS 64
 
@@ -383,6 +390,11 @@ int obasm_main(int argc, char **argv) {
       return 1;
     }
     o.in = a;
+  }
+
+  if (!o.triple) {
+    const char *dt = WALL_DEFAULT_TARGET;
+    if (dt && dt[0]) o.triple = dt;
   }
 
   if (!o.in) {

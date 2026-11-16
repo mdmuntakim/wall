@@ -28,6 +28,11 @@
 #include "wall/wall.h"
 #include "wall_log.h"
 
+/* Baked-in default target triple (set by scripts/build.sh from $TARGET). */
+#ifndef WALL_DEFAULT_TARGET
+#define WALL_DEFAULT_TARGET ""
+#endif
+
 typedef int (*wall_compile_fn)(const char *, int, char **, char **);
 typedef int (*wall_version_fn)(char *, int);
 typedef int (*wall_assemble_fn)(int, char **);
@@ -814,6 +819,7 @@ int main(int argc, char **argv) {
   Drv d;
   memset(&d, 0, sizeof(d));
   d.opt_level = 0;
+  d.target = WALL_DEFAULT_TARGET[0] ? WALL_DEFAULT_TARGET : NULL;
 
   /* Compatibility symlinks. */
   if (!strcmp(prog, "obasm")) {

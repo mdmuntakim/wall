@@ -14,6 +14,9 @@ cd "$ROOT"
 TMP="$ROOT/tests/tmp"
 rm -rf "$TMP"
 mkdir -p "$TMP"
+# Hermetic temp directory for the driver's temporaries; also makes the suite
+# work under a cross TEST_RUNNER where the compiled-in Termux prefix is absent.
+export TMPDIR="$TMP"
 
 RUNNER=()
 if [ -n "${TEST_RUNNER:-}" ]; then
@@ -61,7 +64,9 @@ help_has_no_examples() {
   ! run_cmd ./wall --help | grep -qi '^Examples:'
 }
 catalogue_available() {
-  run_cmd ./wall --help=all | grep -qi 'relocation'
+  # No grep -q: it exits on the first match and SIGPIPEs the writer, which
+  # fails the pipeline under `set -o pipefail` (the catalogue is long).
+  run_cmd ./wall --help=all | grep -i 'relocation' >/dev/null
 }
 unknown_option_fails() {
   ! run_cmd ./wall --definitely-not-an-option >/dev/null 2>&1

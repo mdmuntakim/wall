@@ -4,7 +4,7 @@ All notable changes to Wall are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.1] - 2026-11-16
 
 ### Added
 
@@ -31,6 +31,11 @@ All notable changes to Wall are documented here. The format follows
 
 - Correct temporary-bitcode suffix so LLVM treats assembler input as IR.
 - Released hidden `.comment` ownership to the Wall build identity.
+- `.deb` package architecture is now `aarch64` (the name Termux's dpkg uses
+  for AArch64) instead of Debian's `arm64`, fixing
+  `package architecture (arm64) does not match system (aarch64)` on install.
+- `.deb` members are stored xz-compressed (`control.tar.xz` / `data.tar.xz`)
+  via `dpkg-deb -Zxz` instead of whatever the build host defaulted to.
 
 ## [1.0.0] - 2026-11-12
 
