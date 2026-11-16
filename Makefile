@@ -5,7 +5,7 @@
 
 SHELL := /bin/bash
 VERSION := $(shell cat VERSION)
-ARCH := $(shell dpkg --print-architecture 2>/dev/null || uname -m)
+ARCH ?= $(shell dpkg --print-architecture 2>/dev/null || uname -m)
 
 .PHONY: all build install package test check clean distclean format help
 

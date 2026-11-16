@@ -26,7 +26,30 @@ SYSROOT="${SYSROOT:-}"
 CFLAGS_EXTRA="${CFLAGS_EXTRA:-}"
 BUILD_DIR="$ROOT/.wallbuild"
 
-if [ -n "$SYSROOT" ]; then
+HOST_TRIPLET="$(gcc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu)"
+CROSS=0
+if [ "$TARGET" != "$HOST_TRIPLET" ]; then
+  CROSS=1
+fi
+
+if [ "$CROSS" = 1 ]; then
+  # Cross build: the host GNU linker cannot emit foreign ELF targets, so use
+  # LLVM's linker, and point the compiler at the cross GCC runtime
+  # (crtbeginS.o, libgcc) that the clang driver does not find by itself.  The
+  # cross GCC runtime already provides the target headers and libraries, so a
+  # forced sysroot is not needed and LLVM's linker cannot resolve the GNU
+  # linker script GROUP entries through one.
+  CROSS_CFLAGS="-fuse-ld=lld -B/usr/lib/gcc-cross/${TARGET} -L/usr/lib/gcc-cross/${TARGET}"
+  for flag in $CFLAGS_EXTRA; do
+    case "$flag" in
+      --sysroot=*) ;;
+      *) CROSS_CFLAGS="$CROSS_CFLAGS $flag" ;;
+    esac
+  done
+  CFLAGS_EXTRA="$CROSS_CFLAGS"
+fi
+
+if [ -n "$SYSROOT" ] && [ "$CROSS" != 1 ]; then
   CFLAGS_EXTRA="--sysroot=$SYSROOT $CFLAGS_EXTRA"
 fi
 
@@ -77,7 +100,16 @@ ln -sf wall ld.wall
 echo "==> Writing Wall .comment sections..."
 clang $CFLAGS "$DEFINE" $INCLUDES src/linker/linker.c src/common/wall_cli.c \
     -o "$BUILD_DIR/stamp"
-"$BUILD_DIR/stamp" --stamp-comment="$COMMENT" wall libwall.so
+if [ -n "${TEST_RUNNER:-}" ]; then
+  read -r -a WALL_RUNNER <<< "$TEST_RUNNER"
+else
+  WALL_RUNNER=()
+fi
+if [ "${#WALL_RUNNER[@]}" -gt 0 ]; then
+  "${WALL_RUNNER[@]}" "$BUILD_DIR/stamp" --stamp-comment="$COMMENT" wall libwall.so
+else
+  "$BUILD_DIR/stamp" --stamp-comment="$COMMENT" wall libwall.so
+fi
 rm -f "$BUILD_DIR/stamp"
 
 install_tree() {
